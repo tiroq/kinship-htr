@@ -55,3 +55,6 @@ artifacts/
 /recovery/
 /polyscriptor/
 *.jsonl
+
+# Indexer local configuration (paths are machine-local)
+/htr-index.json

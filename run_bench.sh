@@ -5,6 +5,7 @@
 #        segmentation kraken-blla (pagexml/blla.mlmodel shipped with polyscriptor).
 # Environment: ARM64 miniconda env "htrbench" (python 3.12, torch 2.14.0, kraken 7.1.1)
 # See env-versions.txt for full pinned versions and model sha256 hashes.
+# Patch file: polyscriptor-local.patch (consolidated; was bench-patch.diff).
 #
 # Usage: run_bench.sh <input-folder> <output-folder>
 set -euo pipefail
