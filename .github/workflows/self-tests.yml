@@ -38,7 +38,8 @@ jobs:
             tests/test_dedup.py \
             tests/test_clean_rebuild.py \
             tests/test_kinship_search02.py \
-            tests/test_polyscriptor_patch.py
+            tests/test_polyscriptor_patch.py \
+            tests/test_live_monitor.py
           do
             echo "::group::$t"
             python "$t"
