@@ -139,6 +139,68 @@ def db_conn(cfg: dict, readonly: bool = False):
     return connect(cfg["db_path"], readonly=readonly)
 
 
+def db_canonical_map(conn) -> dict:
+    """(sha256, config_fingerprint) -> page_id for every valid canonical
+    recognition result (status ok WITH lines).
+
+    Dedup requires BOTH image content and recognition configuration to match:
+    the same scan recognized under a different model/patch is NOT a
+    duplicate.  Fingerprints are recomputed from stored provenance with the
+    normalized patch so legacy and new artifacts compare correctly; rows
+    whose provenance lacks the keys yield no fingerprint and never match.
+    """
+    from htr_sidecar import fingerprint_from_provenance
+    out: dict[tuple[str, str], str] = {}
+    try:
+        for row in conn.execute(
+                "SELECT page_id, image_sha256, provenance FROM pages "
+                "WHERE status='ok' AND image_sha256 IS NOT NULL "
+                "AND image_sha256!='' AND COALESCE(line_count,0)>0"):
+            try:
+                prov = json.loads(row["provenance"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            fp = fingerprint_from_provenance(prov)
+            if not fp:
+                continue
+            out.setdefault((row["image_sha256"], fp), row["page_id"])
+    except Exception:
+        pass                     # caller reports queue_db_error if this matters
+    return out
+
+
+def current_recognition_fingerprint() -> str:
+    from htr_sidecar import config_fingerprint
+    from stage_a_runner import RECOGNITION_IDENTITY
+    return config_fingerprint(RECOGNITION_IDENTITY)
+
+
+def resolve_canonical(conn, page_id: str, *, max_hops: int = 8) -> str | None:
+    """Follow duplicate aliases until a VALID canonical result: status ok,
+    lines present, no further alias.  Returns None for chains that dead-end
+    (duplicate->duplicate with no ok target, cycles, missing pages) — such
+    pages must be recognized instead of deduplicated."""
+    seen: set[str] = set()
+    cur = page_id
+    for _ in range(max_hops):
+        if cur in seen:
+            return None
+        seen.add(cur)
+        row = conn.execute(
+            "SELECT status, canonical_page_id, line_count FROM pages "
+            "WHERE page_id=?", (cur,)).fetchone()
+        if row is None:
+            return None
+        if (row["status"] == "ok" and not row["canonical_page_id"]
+                and (row["line_count"] or 0) > 0):
+            return cur
+        nxt = row["canonical_page_id"]
+        if not nxt:
+            return None
+        cur = nxt
+    return None
+
+
 def db_page_status(cfg: dict, page_id: str) -> str | None:
     try:
         conn = db_conn(cfg, readonly=True)
@@ -261,17 +323,19 @@ def build_queue(cfg: dict, limit: int = 0) -> tuple[list[dict], dict]:
 
     # batched DB reads (one pass instead of thousands of queries/round)
     db_status_map: dict[str, str] = {}
-    sha_map: dict[str, str] = {}
+    dedup_map: dict = {}
+    conn = None
     try:
         conn = db_conn(cfg, readonly=True)
-        for row in conn.execute("SELECT page_id, status, image_sha256 "
-                                "FROM pages"):
+        for row in conn.execute("SELECT page_id, status FROM pages"):
             db_status_map[row["page_id"]] = row["status"]
-            if row["status"] in ("ok", "duplicate") and row["image_sha256"]:
-                sha_map.setdefault(row["image_sha256"], row["page_id"])
-        conn.close()
+        dedup_map = db_canonical_map(conn)
     except Exception as e:
         log_event(cfg, "queue_db_error", error=repr(e))
+    try:
+        current_fp = current_recognition_fingerprint()
+    except Exception:
+        current_fp = None
 
     by_source: dict[str, list[dict]] = {}
     for rec in stable_files(cfg):
@@ -300,12 +364,16 @@ def build_queue(cfg: dict, limit: int = 0) -> tuple[list[dict], dict]:
                     pass
             stats["failed_retry"] += 1
 
-        # pre-recognition dedup: identical content already indexed?
+        # pre-recognition dedup: identical content AND identical recognition
+        # configuration already indexed?  The canonical target must resolve
+        # directly to a valid ok result (never another duplicate).
         sha = rec.get("sha256")
-        canonical = sha_map.get(sha) if sha else None
+        canonical = dedup_map.get((sha, current_fp)) if (sha and current_fp) else None
         if canonical == pid:
             canonical = None
-        if canonical:
+        if canonical and conn is not None:
+            canonical = resolve_canonical(conn, canonical)
+        if canonical and canonical != pid:
             try:
                 from htr_sidecar import read_sidecar
                 write_duplicate_sidecar(cfg, rec, canonical)
@@ -323,6 +391,8 @@ def build_queue(cfg: dict, limit: int = 0) -> tuple[list[dict], dict]:
         rec["image_sha256"] = rec.get("sha256") or ""
         rec["_new"] = (now - _epoch(rec.get("discovered_at"))) < 6 * 3600
         by_source.setdefault(rec["source_id"], []).append(rec)
+    if conn is not None:
+        conn.close()
 
     order = sorted(by_source, key=lambda s: prio.get(s, 50))
     queue: list[dict] = []
@@ -603,16 +673,22 @@ def cmd_daemon(cfg: dict, ns) -> int:
         while not STOP.is_set():
             t0 = time.time()
             try:
+                t = time.time()
                 summary = poll(cfg)
+                poll_s = round(time.time() - t, 2)
                 if not imported_once:
                     st = legacy_to_sidecars(cfg, quiet=True)
                     _log(f"legacy import: {st}")
                     imported_once = True
+                t = time.time()
                 rec = reconcile(cfg)
+                reconcile_s = round(time.time() - t, 2)
                 if rec["sidecars_written"] or rec["db_upserts"]:
                     _log(f"reconcile: {rec}")
+                t = time.time()
                 queue, qstats = build_queue(
                     cfg, limit=int(cfg["round_pages"]))
+                queue_s = round(time.time() - t, 2)
                 hb = {"pid": os.getpid(), "updated_epoch": time.time(),
                       "phase": "idle" if not queue else "round",
                       "queue": qstats, "rounds": rounds,
@@ -624,17 +700,50 @@ def cmd_daemon(cfg: dict, ns) -> int:
                     _log(f"round {rounds}: {len(queue)} page(s) "
                          f"(stable={qstats['stable']} pending="
                          f"{qstats['pending']})")
+                    t = time.time()
                     round_out = run_round(cfg, queue)
+                    round_wall_s = round(time.time() - t, 2)
+                    t = time.time()
                     fin = finalize(cfg, queue)
+                    finalize_s = round(time.time() - t, 2)
+                    # measured recognition time of this round's pages
+                    page_sum = 0.0
+                    page_n = 0
+                    for p in queue:
+                        try:
+                            meta = json.loads(
+                                (Path(cfg["ocr_root"]) / p["page_id"] /
+                                 "meta.json").read_text(encoding="utf-8"))
+                            page_sum += float(meta.get("elapsed_s") or 0)
+                            page_n += 1
+                        except (OSError, json.JSONDecodeError, ValueError):
+                            pass
+                    page_sum = round(page_sum, 1)
                     log_event(cfg, "round_finished", round_no=rounds,
                               queue=qstats, round=round_out, finalize=fin)
-                    _log(f"round {rounds} done: {fin}")
+                    # P1-runtime: where wall time actually goes (theoretical
+                    # 3600/avg_page vs measured rate is explained here)
+                    log_event(cfg, "round_timing", round_no=rounds,
+                              pages=len(queue), pages_timed=page_n,
+                              poll_s=poll_s, reconcile_s=reconcile_s,
+                              queue_s=queue_s, round_wall_s=round_wall_s,
+                              finalize_s=finalize_s,
+                              page_elapsed_sum_s=page_sum,
+                              round_overhead_s=round(round_wall_s - page_sum,
+                                                     2),
+                              loop_s=round(time.time() - t0, 2))
+                    _log(f"round {rounds} done: {fin} "
+                         f"wall={round_wall_s}s pages={page_sum}s")
                     if round_out.get("stopped"):
                         break
                     if fin["indexed"] == 0 and fin["failed"] == 0:
-                        time.sleep(int(cfg["poll_interval_s"]))
+                        slp = int(cfg["poll_interval_s"])
+                        log_event(cfg, "worker_sleep", seconds=slp)
+                        time.sleep(slp)
                 else:
-                    time.sleep(int(cfg["poll_interval_s"]))
+                    slp = int(cfg["poll_interval_s"])
+                    log_event(cfg, "worker_sleep", seconds=slp)
+                    time.sleep(slp)
             except Exception as e:
                 log_event(cfg, "daemon_error", error=repr(e),
                           traceback=traceback.format_exc()[-2000:])

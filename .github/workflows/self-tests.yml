@@ -1,0 +1,46 @@
+name: self-tests
+
+# Self-contained validation only: synthetic fixtures, no archival datasets,
+# no HTR model weights, no torch/kraken.  Integration tests that need the
+# local corpus (tests/test_known_positive_258p014.py) and the local
+# polyscriptor checkout guard (tests/test_polyscriptor_patch.py, which
+# self-skips here) are intentionally NOT part of CI.
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  self-contained:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install lightweight dependencies (no model weights)
+        run: python -m pip install --quiet rapidfuzz pillow
+
+      - name: Run self-contained test suites
+        run: |
+          set -euo pipefail
+          for t in \
+            tests/test_sidecar.py \
+            tests/test_inventory.py \
+            tests/test_legacy_import.py \
+            tests/test_db_rebuild.py \
+            tests/test_search_filters.py \
+            tests/test_review_integrity.py \
+            tests/test_dedup.py \
+            tests/test_clean_rebuild.py \
+            tests/test_kinship_search02.py \
+            tests/test_polyscriptor_patch.py
+          do
+            echo "::group::$t"
+            python "$t"
+            echo "::endgroup::"
+          done

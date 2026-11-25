@@ -10,6 +10,7 @@ Run:  htrbench-python tests/test_search_filters.py   (pytest-compatible)
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -100,24 +101,12 @@ def main() -> int:
               f.lead_status == "SECONDARY-LEAD",
               f"fuzzy label: {f and f.match_kind}")
 
-        # human-confirmed review upgrades the label
-        import json
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        line_id = conn.execute(
-            "SELECT line_id FROM lines WHERE page_id='253-p001' "
-            "AND line_number=1").fetchone()["line_id"]
-        conn.execute(
-            "INSERT INTO reviews(line_id, page_id, line_number, decision, "
-            "verified_text, notes, source_sha256, case_id, page_number, "
-            "bbox, model_text, reviewer, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (line_id, "253-p001", 1, "confirmed", "село Протасьево приход",
-             "human", "bb" * 32, "cgamos:253", 1, None, "machine", "tester",
-             "2026-11-25T12:00:00+0000"))
-        conn.commit()
-        conn.close()
+        # human-confirmed review upgrades the label (production write path)
+        from tests._fixtures import add_review
+        sc253 = json.loads(
+            (sidecar_root / "253-p001.htr.json").read_text())
+        add_review(db_path, sc253, 1, decision="confirmed",
+                   verified_text="село Протасьево приход", notes="human")
         s.close()
         s = Searcher(db_path=db_path)
         hits = s.search_lines("Протасьево")

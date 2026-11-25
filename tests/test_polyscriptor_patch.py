@@ -31,6 +31,12 @@ def check(cond, msg):
 
 
 def main() -> int:
+    if not (REPO / "polyscriptor" / ".git").exists():
+        # local integration guard: the checkout (and its working-tree patch)
+        # is not part of the repository; CI runs the self-contained suites
+        print("SKIP test_polyscriptor_patch: local polyscriptor checkout "
+              "required (integration-only)")
+        return 0
     patch_path = REPO / "polyscriptor-local.patch"
     check(patch_path.exists(), "polyscriptor-local.patch present")
     if not patch_path.exists():

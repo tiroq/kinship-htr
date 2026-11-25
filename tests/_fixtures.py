@@ -123,14 +123,56 @@ def make_sidecars(sidecar_root: Path) -> dict[str, dict]:
     return out
 
 
-def build_test_db(db_path: Path, sidecar_root: Path):
-    """Create the fixture DB via the real rebuild path; returns db module."""
+def add_review(db_path: Path, sidecar: dict, line_number: int, *,
+               decision: str = "confirmed", verified_text: str | None = None,
+               notes: str | None = None, reviewer: str = "tester",
+               updated_at: str = "2026-11-25T12:00:00+0000",
+               reviews_path: Path | None = None) -> dict:
+    """Create a review through the PRODUCTION write path (durable JSONL
+    store first, then the DB view) with full binding fields taken from the
+    sidecar — never a raw table INSERT."""
+    from htr_reviews import make_record, save_review
+    from htr_search.db import connect
+    line = next(ln for ln in sidecar["lines"]
+                if ln["line_number"] == line_number)
+    record = make_record(
+        page_id=sidecar["source"]["page_id"], line_number=line_number,
+        image_sha256=sidecar["source"]["sha256"],
+        recognition_revision=int(sidecar["recognition"].get("revision", 1)),
+        bbox_xyxy=line["bbox"], decision=decision,
+        verified_text=verified_text, notes=notes,
+        model_text=line["text_raw"], reviewer=reviewer,
+        case_id=sidecar["source"]["case_ref"],
+        page_number=sidecar["source"]["page_number"])
+    record["updated_at"] = updated_at
+    if reviews_path is None:
+        reviews_path = db_path.parent / "reviews.jsonl"
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT line_id FROM lines WHERE page_id=? AND line_number=?",
+        (record["page_id"], line_number)).fetchone()
+    conn.close()
+    assert row is not None, f"no line {line_number} for review test"
+    save_review({"reviews_path": str(reviews_path)}, db_path, record,
+                line_id=row["line_id"], match_state="active")
+    return record
+
+
+def build_test_db(db_path: Path, sidecar_root: Path,
+                  reviews_path: Path | None = None):
+    """Create the fixture DB via the real rebuild path; returns build stats.
+
+    `reviews_path` isolates the durable review store (tests must never touch
+    the live store); default is a sibling of the DB."""
     from htr_search import db as dbmod
     saved_selection = dbmod.SELECTION
     dbmod.SELECTION = Path("/nonexistent-selection.json")
+    if reviews_path is None:
+        reviews_path = db_path.parent / "reviews.jsonl"
     try:
         stats = dbmod.build(db_path, sidecar_root=sidecar_root,
-                            import_legacy=False)
+                            import_legacy=False,
+                            reviews_path=reviews_path)
     finally:
         dbmod.SELECTION = saved_selection
     return stats

@@ -65,6 +65,19 @@ BLLA_SHA = "77a638a83c9e535620827a09e410ed36391e9e8e8366d5796a0f15b978186056"
 PATCH_ID = ("polyscriptor-local.patch (formerly bench-patch.diff; "
             "min_height 40->15 + width guard, applied)")
 
+# Canonical identity of the recognition configuration.  Shared with the
+# indexer's content+config dedup key (htr_worker) — must stay equal to the
+# provenance of artifacts produced by worker_main.
+RECOGNITION_IDENTITY = {
+    "engine": "crnn-ctc (PyLaia-inspired CRNN-CTC)",
+    "model": "achimrabus/crnn-ctc-russian 'Russian (6.92% CER)'",
+    "model_sha256": MODEL_SHA,
+    "segmentation": "kraken-blla",
+    "segmentation_sha256": BLLA_SHA,
+    "patch": PATCH_ID,
+    "device": "cpu",
+}
+
 CASES = {"253": "0597-0001-000253", "255": "0597-0001-000255",
          "256": "0597-0001-000256", "258": "0597-0001-000258"}
 BENCH8_PAGES = {"253-p003", "253-p032", "255-p003", "255-p027",
@@ -135,16 +148,18 @@ def load_pages() -> list[dict]:
 
 
 def provenance(page: dict, reused: bool = False) -> dict:
+    ident = RECOGNITION_IDENTITY
     return {
         "page_id": page["page_id"], "case_id": page["case_id"],
         "page_number": page["page_number"], "image_path": page["image_path"],
         "image_sha256": page["image_sha256"],
-        "engine": "crnn-ctc (PyLaia-inspired CRNN-CTC)",
-        "model": "achimrabus/crnn-ctc-russian 'Russian (6.92% CER)'",
-        "model_sha256": MODEL_SHA, "segmentation": "kraken-blla",
-        "blla_sha256": BLLA_SHA, "patch": PATCH_ID,
+        "engine": ident["engine"], "model": ident["model"],
+        "model_sha256": ident["model_sha256"],
+        "segmentation": ident["segmentation"],
+        "blla_sha256": ident["segmentation_sha256"],
+        "patch": ident["patch"],
         "env": "miniconda htrbench (see env-versions.txt; python 3.12, torch 2.14.0, kraken 7.1.1)",
-        "device": "cpu", "reused_from_benchmark": reused,
+        "device": ident["device"], "reused_from_benchmark": reused,
     }
 
 

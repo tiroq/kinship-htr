@@ -96,21 +96,14 @@ def main() -> int:
               "g999-p000" in (d["error"] or ""),
               f"duplicate points at canonical page: {d['provenance']}")
 
-        # --- 6. review survives rebuild via (page_id, line_number) -------
-        line_id = conn.execute(
-            "SELECT line_id FROM lines WHERE page_id='g999-p000' "
-            "AND line_number=1").fetchone()["line_id"]
-        conn.execute(
-            "INSERT INTO reviews(line_id, page_id, line_number, decision, "
-            "verified_text, notes, source_sha256, case_id, page_number, "
-            "bbox, model_text, reviewer, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (line_id, "g999-p000", 1, "confirmed",
-             "Той же вотчины деревни Волченокъ крестьянин", "human read",
-             "aa" * 32, "gavo-I331-3-999", 0, "[10,20,300,40]",
-             "machine", "tester", "2026-11-25T12:00:00+0000"))
-        conn.commit()
+        # --- 6. review survives rebuild (durable store, full binding) ----
         conn.close()
+        from tests._fixtures import add_review
+        sc_g = json.loads((sidecar_root / "g999-p000.htr.json").read_text())
+        record = add_review(
+            db_path, sc_g, 1, decision="confirmed",
+            verified_text="Той же вотчины деревни Волченокъ крестьянин",
+            notes="human read")
 
         stats2 = build_test_db(db_path, sidecar_root)
         conn = sqlite3.connect(db_path)
@@ -123,10 +116,18 @@ def main() -> int:
         check(rev is not None and rev["decision"] == "confirmed" and
               rev["verified_text"].startswith("Той же"),
               "human review decision preserved across rebuild")
-        check(rev is not None and rev["line_id"] == new_line_id,
-              "review remapped onto the new line_id")
-        check(stats2["reviews_remapped"] >= 1,
-              f"remap counted: {stats2['reviews_remapped']}")
+        check(rev is not None and rev["line_id"] == new_line_id and
+              rev["match_state"] == "active",
+              "review rebound onto the new line_id (active)")
+        check(rev is not None and rev["record_id"] == record["record_id"],
+              "durable record id preserved across rebuild")
+        check(rev is not None and rev["image_sha256"] ==
+              sc_g["source"]["sha256"] and rev["recognition_revision"] == 1,
+              "review bound to image sha + recognition revision")
+        check(stats2["reviews_active"] >= 1 and
+              stats2["reviews_unresolved"] == 0,
+              f"active/unresolved counts: {stats2['reviews_active']}/"
+              f"{stats2['reviews_unresolved']}")
         check(conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 1,
               "exactly one review row (no duplication)")
 

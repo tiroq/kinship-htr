@@ -127,6 +127,9 @@ def load(path: str | Path | None = None) -> dict:
     cfg["pid_path"] = str(Path(cfg["runtime_root"]) / "worker.pid")
     cfg["lock_path"] = str(Path(cfg["runtime_root"]) / "worker.lock")
     cfg["progress_log"] = str(Path(cfg["logs_dir"]) / "progress.jsonl")
+    # durable human-review store (source of truth; DB reviews are a view)
+    cfg["reviews_path"] = str(Path(cfg["runtime_root"]) / "reviews" /
+                              "reviews.jsonl")
     return cfg
 
 

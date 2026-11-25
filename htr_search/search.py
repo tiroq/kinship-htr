@@ -147,14 +147,23 @@ class Searcher:
         fsql, fparams = "", []
         if filters:
             clauses = []
-            for col, key in (("p.case_short", "case"),
-                             ("p.collection", "collection"),
-                             ("p.fond", "fond"), ("p.opis", "opis"),
-                             ("p.delo", "delo"), ("p.page_id", "page")):
+            for col, key in (("case_short", "case"),
+                             ("collection", "collection"),
+                             ("fond", "fond"), ("opis", "opis"),
+                             ("delo", "delo"), ("page_id", "page")):
                 val = filters.get(key)
                 if val:
-                    clauses.append(f"{col}=?")
-                    fparams.append(str(val))
+                    # A duplicate page stores no lines of its own; its
+                    # recognized text lives on the canonical page.  Accept a
+                    # row when ITS column matches OR when a duplicate
+                    # alias of it (canonical_page_id = p.page_id) matches —
+                    # so filtering a duplicate collection still retrieves
+                    # the recognized text.
+                    clauses.append(
+                        f"(p.{col}=? OR EXISTS(SELECT 1 FROM pages al "
+                        f"WHERE al.canonical_page_id=p.page_id "
+                        f"AND al.{col}=?))")
+                    fparams.extend([str(val), str(val)])
             if clauses:
                 fsql = " AND " + " AND ".join(clauses)
         for i in range(0, len(ids), 900):
@@ -303,13 +312,17 @@ class Searcher:
                 range(max(0, idx - k), min(len(rows), idx + k + 1)) if j != idx]
 
     def _reviews_for(self, line_ids: list[int]) -> list[dict]:
-        """Human review decisions for the given line ids (reviews table)."""
+        """ACTIVE human review decisions for the given line ids.
+
+        Unresolved/historical review rows (line_id NULL) are never returned
+        here — they carry no current binding and cannot label a hit."""
         if not line_ids:
             return []
         ph = ",".join("?" * len(line_ids))
         return [dict(r) for r in self.conn.execute(
             "SELECT line_id, page_id, decision, verified_text, notes "
-            f"FROM reviews WHERE line_id IN ({ph})", line_ids)]
+            f"FROM reviews WHERE match_state='active' AND line_id IN ({ph})",
+            line_ids)]
 
     def _provisional_for(self, hits: list[Hit]) -> dict:
         out = {}

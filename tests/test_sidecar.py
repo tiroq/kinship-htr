@@ -121,6 +121,15 @@ def main() -> int:
         reloaded = read_sidecar(target)
         check(reloaded["recognition"]["revision"] == 2,
               f"revision bumped: {reloaded['recognition']['revision']}")
+        check(all(ln["line_id"].startswith("g999-p000-r2-")
+                  for ln in reloaded["lines"]),
+              "line ids re-stamped to the bumped revision (consistency)")
+        check(reloaded["lines"][0]["line_id"] ==
+              f"g999-p000-r2-{1:04d}",
+              f"line id format page-rev-seq: "
+              f"{reloaded['lines'][0]['line_id']}")
+        check(reloaded["artifact_integrity"]["previous_revision"] == 1,
+              "previous revision recorded")
         rev_dir = target.parent / "revisions"
         archived = list(rev_dir.glob("*.rev1.json"))
         check(len(archived) == 1, "previous revision preserved on reprocess")

@@ -1,22 +1,25 @@
 """Index builder: portable sidecars -> SQLite + FTS5 (unified searchable DB).
 
-The sidecar tree (htr_sidecar.py) is the portable source of truth; this
-module can rebuild the whole database from it without rerunning HTR:
+The sidecar tree (htr_sidecar.py) is the portable source of truth for
+recognition; the durable JSONL review store (htr_reviews.py) is the source
+of truth for human reviews.  This module MATERIALIZES both into SQLite:
 
     python -m htr_search.db            # rebuild (also imports legacy pages)
 
-Legacy per-page artifacts (work/index/ocr/<page>/, pre-dating sidecars) are
-converted to sidecars first (htr_import.legacy_to_sidecars), so one command
-covers the full corpus.
+Review integrity rules (P0):
+  * a human review is NEVER deleted — recognition changes only flip its
+    `match_state` between `active` (fully bound: image sha + recognition
+    revision + line_number + bbox all match) and `unresolved` (explicit
+    reason: page_missing / image_changed / revision_changed / line_missing /
+    geometry_changed / superseded);
+  * HUMAN-VERIFIED status is never transferred to a different spatial
+    region, revision or image;
+  * every DB review row corresponds to a durable record, so a complete
+    database loss is recoverable from `reviews.jsonl` alone.
 
-Diplomatic OCR text (text_raw) is never modified.  Normalized copies exist
-only in lines.text_norm and the FTS5 indexes.  Human review decisions live
-in `reviews` and are remapped by their stable (page_id, line_number) key on
-every rebuild/upsert — never discarded.  AI-draft provisional references
-live in `provisional_refs` and are NEVER promoted to human ground truth.
-
-`lines.bbox` stays [x, y, w, h] (historical server/UI consumers); sidecars
-store [x_min, y_min, x_max, y_max] — conversion is tested.
+Diplomatic OCR text (text_raw) is never modified.  `lines.bbox` stays
+[x, y, w, h] (historical server/UI consumers); sidecars store
+[x_min, y_min, x_max, y_max] — conversion is tested.
 """
 from __future__ import annotations
 
@@ -35,12 +38,14 @@ try:
     SIDECAR_ROOT = Path(_CFG["sidecar_root"])
     LEGACY_OCR_ROOT = Path(_CFG["legacy_ocr_root"])
     LEGACY_MANIFEST = Path(_CFG["legacy_manifest"])
+    REVIEWS_PATH = Path(_CFG["reviews_path"])
 except Exception:  # config unavailable (e.g. bare checkout) — historical defaults
     BENCH = Path(__file__).resolve().parent.parent
     DB_PATH = BENCH / "work" / "index" / "htr.db"
     SIDECAR_ROOT = BENCH / "work" / "indexer" / "sidecars"
     LEGACY_OCR_ROOT = BENCH / "work" / "index" / "ocr"
     LEGACY_MANIFEST = BENCH / "work" / "index_manifest.json"
+    REVIEWS_PATH = BENCH / "work" / "indexer" / "reviews" / "reviews.jsonl"
 
 SELECTION = DB_PATH.parent / ".." / "selection.json"  # AI-draft provisional refs
 SELECTION = SELECTION.resolve()
@@ -55,7 +60,7 @@ CREATE TABLE IF NOT EXISTS pages(
   line_count INTEGER, extra_line_count INTEGER, avg_confidence REAL,
   processed_at TEXT, provenance TEXT, error TEXT,
   collection TEXT, archive TEXT, fond TEXT, opis TEXT, delo TEXT,
-  UNIQUE(case_short, page_number)
+  canonical_page_id TEXT
 );
 CREATE TABLE IF NOT EXISTS lines(
   line_id INTEGER PRIMARY KEY,
@@ -76,9 +81,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS lines_trgm USING fts5(
   text_norm, content='lines', content_rowid='line_id', tokenize='trigram');
 CREATE TABLE IF NOT EXISTS reviews(
   review_id INTEGER PRIMARY KEY,
-  line_id INTEGER UNIQUE NOT NULL REFERENCES lines(line_id),
+  record_id TEXT UNIQUE,
+  line_id INTEGER,
   page_id TEXT NOT NULL,
-  line_number INTEGER NOT NULL DEFAULT 0,
+  line_number INTEGER NOT NULL,
   decision TEXT NOT NULL CHECK(decision IN ('confirmed','rejected','uncertain')),
   verified_text TEXT,
   notes TEXT,
@@ -86,8 +92,17 @@ CREATE TABLE IF NOT EXISTS reviews(
   case_id TEXT NOT NULL, page_number INTEGER NOT NULL,
   bbox TEXT, model_text TEXT,
   reviewer TEXT NOT NULL DEFAULT 'local-human',
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  image_sha256 TEXT,
+  recognition_revision INTEGER,
+  match_state TEXT NOT NULL DEFAULT 'unresolved'
+      CHECK(match_state IN ('active','unresolved')),
+  match_reason TEXT,
+  bbox_convention TEXT NOT NULL DEFAULT 'xyxy-original-image-pixels'
 );
+CREATE UNIQUE INDEX IF NOT EXISTS ux_reviews_active_line
+  ON reviews(line_id) WHERE line_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_reviews_page ON reviews(page_id);
 CREATE TABLE IF NOT EXISTS provisional_refs(
   page_id TEXT NOT NULL, line_number INTEGER NOT NULL,
   text TEXT, provenance TEXT, verified_flag INTEGER,
@@ -105,7 +120,12 @@ CREATE TABLE IF NOT EXISTS search_results(
 );
 """
 
-PAGE_EXTRA_COLS = ("collection", "archive", "fond", "opis", "delo")
+PAGE_EXTRA_COLS = ("collection", "archive", "fond", "opis", "delo",
+                   "canonical_page_id")
+
+NEW_REVIEWS_COLS = ("record_id", "line_id", "image_sha256",
+                    "recognition_revision", "match_state", "match_reason",
+                    "bbox_convention")
 
 
 def connect(db_path: Path | str | None = None, readonly: bool = False) -> sqlite3.Connection:
@@ -119,6 +139,8 @@ def connect(db_path: Path | str | None = None, readonly: bool = False) -> sqlite
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
+
+# ---------------------------------------------------------------- migration
 
 def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(pages)")}
@@ -135,8 +157,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "archive='ГАВО (Государственный архив Воронежской области)', "
         "fond='И331', opis='3', delo=substr(case_short,2) "
         "WHERE collection IS NULL AND case_short GLOB 'g[0-9]*'")
+
+    rcols = {r[1] for r in conn.execute("PRAGMA table_info(reviews)")}
+    if "match_state" not in rcols:
+        _rebuild_reviews_table(conn)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(reviews)")}
-    if "line_number" not in cols:
+    if "line_number" not in cols:      # ancient shape safety net
         conn.execute("ALTER TABLE reviews ADD COLUMN line_number INTEGER")
         conn.execute(
             "UPDATE reviews SET line_number="
@@ -144,18 +170,216 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-# ---------------------------------------------------------------- helpers
+def _rebuild_reviews_table(conn: sqlite3.Connection) -> None:
+    """Legacy reviews (line_id NOT NULL, no binding columns) -> P0 schema.
 
-def _legacy_dims() -> dict:
-    """page_id -> (width, height) from the historical index manifest."""
-    out = {}
-    try:
-        for pid, (_p, _sha, w, h) in json.loads(
-                LEGACY_MANIFEST.read_text(encoding="utf-8")).items():
-            out[pid] = (w, h)
-    except (OSError, json.JSONDecodeError, ValueError):
-        pass
-    return out
+    Every legacy row is preserved with a durable record id and its bindings
+    derived from the current index; nothing is dropped.  Runs inside a
+    transaction opened by the caller context (sqlite3 implicit txn)."""
+    from htr_sidecar import xywh_to_xyxy
+    from htr_reviews import synthetic_record_id
+    legacy = [dict(r) for r in conn.execute("SELECT * FROM reviews")]
+    conn.execute("ALTER TABLE reviews RENAME TO reviews_legacy")
+    # indexes created by SCHEMA followed the rename — drop them by name
+    # before recreating the fresh table (name collision otherwise)
+    conn.execute("DROP INDEX IF EXISTS ux_reviews_active_line")
+    conn.execute("DROP INDEX IF EXISTS idx_reviews_page")
+    conn.execute("""
+        CREATE TABLE reviews(
+          review_id INTEGER PRIMARY KEY,
+          record_id TEXT UNIQUE,
+          line_id INTEGER,
+          page_id TEXT NOT NULL,
+          line_number INTEGER NOT NULL,
+          decision TEXT NOT NULL CHECK(decision IN ('confirmed','rejected','uncertain')),
+          verified_text TEXT,
+          notes TEXT,
+          source_sha256 TEXT NOT NULL,
+          case_id TEXT NOT NULL, page_number INTEGER NOT NULL,
+          bbox TEXT, model_text TEXT,
+          reviewer TEXT NOT NULL DEFAULT 'local-human',
+          updated_at TEXT NOT NULL,
+          image_sha256 TEXT,
+          recognition_revision INTEGER,
+          match_state TEXT NOT NULL DEFAULT 'unresolved'
+              CHECK(match_state IN ('active','unresolved')),
+          match_reason TEXT,
+          bbox_convention TEXT NOT NULL DEFAULT 'xyxy-original-image-pixels'
+        )""")
+    conn.execute(
+        "CREATE UNIQUE INDEX ux_reviews_active_line ON reviews(line_id) "
+        "WHERE line_id IS NOT NULL")
+    for i, r in enumerate(legacy, start=1):
+        bbox = r.get("bbox")
+        if isinstance(bbox, str) and bbox:
+            try:
+                bbox = xywh_to_xyxy(json.loads(bbox))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                bbox = None
+        revision = conn.execute(
+            "SELECT provenance FROM pages WHERE page_id=?",
+            (r.get("page_id"),)).fetchone()
+        rev = None
+        if revision and revision["provenance"]:
+            try:
+                rev = json.loads(revision["provenance"]).get("revision")
+            except json.JSONDecodeError:
+                rev = None
+        rid = r.get("record_id") or synthetic_record_id(r)
+        line_id = r.get("line_id")
+        conn.execute(
+            "INSERT INTO reviews(review_id, record_id, line_id, page_id, "
+            "line_number, decision, verified_text, notes, source_sha256, "
+            "case_id, page_number, bbox, model_text, reviewer, updated_at, "
+            "image_sha256, recognition_revision, match_state, match_reason, "
+            "bbox_convention) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (i, rid, line_id, r["page_id"], r["line_number"], r["decision"],
+             r.get("verified_text"), r.get("notes"), r["source_sha256"],
+             r["case_id"], r["page_number"],
+             json.dumps(bbox) if bbox is not None else None,
+             r.get("model_text"), r.get("reviewer", "local-human"),
+             r["updated_at"], r.get("image_sha256") or r["source_sha256"],
+             rev, "active" if line_id else "unresolved",
+             None if line_id else "legacy-unmatched",
+             "xyxy-original-image-pixels"))
+    conn.execute("DROP TABLE reviews_legacy")
+    # re-verify every binding against the CURRENT index (sha/revision/geometry)
+    _reverify_all_reviews(conn)
+
+
+# ---------------------------------------------------------------- review view
+
+def _page_binding(conn: sqlite3.Connection, page_id: str):
+    """(image_sha256|None, recognition_revision|None, line_map) for a page."""
+    page = conn.execute(
+        "SELECT image_sha256, provenance FROM pages WHERE page_id=?",
+        (page_id,)).fetchone()
+    if page is None:
+        return None, None, {}
+    revision = None
+    if page["provenance"]:
+        try:
+            revision = json.loads(page["provenance"]).get("revision")
+        except json.JSONDecodeError:
+            revision = None
+    line_map: dict[int, tuple[int, str]] = {}
+    for r in conn.execute(
+            "SELECT line_id, line_number, bbox FROM lines WHERE page_id=?",
+            (page_id,)):
+        # DB stores xywh; binding convention is xyxy — convert once here
+        x, y, w, h = json.loads(r["bbox"])
+        line_map.setdefault(int(r["line_number"]),
+                            (r["line_id"], json.dumps([x, y, x + w, y + h])))
+    return page["image_sha256"], revision, line_map
+
+
+def _verify_review_row(conn: sqlite3.Connection, row) -> tuple:
+    """Current binding state of one review row (never destructive)."""
+    from htr_reviews import match_review_record, record_from_db_row
+    page_sha, revision, line_map = _page_binding(conn, row["page_id"])
+    record = record_from_db_row(row)
+    return match_review_record(record, page_sha=page_sha, revision=revision,
+                               line_map=line_map)
+
+
+def _apply_row_match(conn: sqlite3.Connection, row, result) -> tuple:
+    line_id, state, reason = result
+    changed = (row["line_id"] != line_id or row["match_state"] != state
+               or row["match_reason"] != reason)
+    if changed:
+        conn.execute(
+            "UPDATE reviews SET line_id=?, match_state=?, match_reason=? "
+            "WHERE review_id=?", (line_id, state, reason, row["review_id"]))
+    return state, changed
+
+
+def _remap_reviews_for_page(conn: sqlite3.Connection, page_id: str) -> tuple:
+    """Re-verify (never delete) every review of `page_id` against the freshly
+    written page: active only on full binding match, otherwise unresolved
+    with an explicit reason.  Returns (active, unresolved)."""
+    active = unresolved = 0
+    seen: set[int] = set()
+    for row in conn.execute("SELECT * FROM reviews WHERE page_id=? "
+                            "ORDER BY updated_at DESC, review_id DESC",
+                            (page_id,)):
+        line_id, state, reason = _verify_review_row(conn, row)
+        if state == "active":
+            if line_id in seen:          # one active review per line
+                line_id, state, reason = None, "unresolved", "superseded"
+            else:
+                seen.add(line_id)
+        _apply_row_match(conn, row, (line_id, state, reason))
+        if state == "active":
+            active += 1
+        else:
+            unresolved += 1
+    return active, unresolved
+
+
+def _reverify_all_reviews(conn: sqlite3.Connection) -> tuple:
+    active = unresolved = 0
+    seen: set[int] = set()
+    for row in conn.execute(
+            "SELECT * FROM reviews ORDER BY updated_at DESC, review_id DESC"):
+        line_id, state, reason = _verify_review_row(conn, row)
+        if state == "active":
+            if line_id in seen:
+                line_id, state, reason = None, "unresolved", "superseded"
+            else:
+                seen.add(line_id)
+        _apply_row_match(conn, row, (line_id, state, reason))
+        if state == "active":
+            active += 1
+        else:
+            unresolved += 1
+    return active, unresolved
+
+
+def apply_review_record(conn: sqlite3.Connection, record: dict, *,
+                        line_id: int | None, match_state: str,
+                        match_reason: str | None = None) -> None:
+    """Materialize one durable review record into the DB view."""
+    rid = record["record_id"]
+    existing = conn.execute("SELECT * FROM reviews WHERE record_id=?",
+                            (rid,)).fetchone()
+    if line_id is not None:
+        # one active review per line: a displaced older binding is preserved
+        # as unresolved/superseded, never deleted
+        other = conn.execute(
+            "SELECT * FROM reviews WHERE line_id=? AND record_id!=?",
+            (line_id, rid)).fetchone()
+        if other:
+            conn.execute(
+                "UPDATE reviews SET line_id=NULL, match_state='unresolved', "
+                "match_reason='superseded' WHERE review_id=?",
+                (other["review_id"],))
+    vals = (
+        record.get("page_id"), int(record.get("line_number", 0)),
+        record["decision"], record.get("verified_text"),
+        record.get("notes"), record.get("image_sha256"),
+        record.get("case_id") or "unknown", int(record.get("page_number") or 0),
+        json.dumps(record.get("bbox")) if record.get("bbox") is not None
+        else None,
+        record.get("model_text"), record.get("reviewer", "local-human"),
+        record["updated_at"], record.get("image_sha256"),
+        record.get("recognition_revision"), match_state, match_reason,
+        record.get("bbox_convention", "xyxy-original-image-pixels"),
+        line_id, rid)
+    if existing:
+        conn.execute(
+            "UPDATE reviews SET page_id=?, line_number=?, decision=?, "
+            "verified_text=?, notes=?, source_sha256=?, case_id=?, "
+            "page_number=?, bbox=?, model_text=?, reviewer=?, updated_at=?, "
+            "image_sha256=?, recognition_revision=?, match_state=?, "
+            "match_reason=?, bbox_convention=?, line_id=? "
+            "WHERE record_id=?", vals)
+    else:
+        conn.execute(
+            "INSERT INTO reviews(page_id, line_number, decision, verified_text,"
+            " notes, source_sha256, case_id, page_number, bbox, model_text,"
+            " reviewer, updated_at, image_sha256, recognition_revision,"
+            " match_state, match_reason, bbox_convention, line_id, record_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
 
 
 def _fts_delete(conn: sqlite3.Connection, line_ids: list[int]) -> None:
@@ -177,39 +401,21 @@ def _fts_delete(conn: sqlite3.Connection, line_ids: list[int]) -> None:
                 "VALUES('delete', ?, ?)", (r["line_id"], r["text_norm"]))
 
 
-def _remap_reviews_for_page(conn: sqlite3.Connection, page_id: str) -> tuple[int, int]:
-    """Re-attach reviews of `page_id` to the current line_ids via the stable
-    (page_id, line_number) key.  Returns (remapped, dropped)."""
-    reviews = list(conn.execute("SELECT * FROM reviews WHERE page_id=?",
-                                (page_id,)))
-    remapped = dropped = 0
-    for r in reviews:
-        row = conn.execute(
-            "SELECT line_id FROM lines WHERE page_id=? AND line_number=?",
-            (page_id, r["line_number"])).fetchone()
-        if row and row["line_id"] != r["line_id"]:
-            conn.execute("UPDATE reviews SET line_id=? WHERE review_id=?",
-                         (row["line_id"], r["review_id"]))
-            remapped += 1
-        elif row is None:
-            # keep the review row orphan-free: park it is not allowed by the
-            # UNIQUE(FK) constraint semantics — drop and count honestly
-            conn.execute("DELETE FROM reviews WHERE review_id=?", (r["review_id"],))
-            dropped += 1
-    return remapped, dropped
-
+# ---------------------------------------------------------------- upsert
 
 def upsert_page(db_path: Path | str | None, sidecar: dict) -> dict:
     """Transactionally index one sidecar (idempotent per page_id).
 
-    Order inside one transaction: capture reviews -> FTS-delete old lines ->
-    delete lines/pages -> insert page+lines -> FTS-insert -> remap reviews.
-    A crash rolls the whole page back; search stays available (WAL).
+    Order inside one transaction: FTS-delete old lines -> delete lines ->
+    insert page+lines -> FTS-insert -> re-verify this page's reviews (never
+    deleting any).  A crash rolls the whole page back; search stays
+    available (WAL).
     """
     conn = connect(db_path)
     stats = {"page_id": sidecar["source"]["page_id"], "lines": 0,
-             "reviews_remapped": 0, "reviews_dropped": 0}
+             "reviews_active": 0, "reviews_unresolved": 0}
     try:
+        conn.executescript(SCHEMA)   # safe on fresh DBs (IF NOT EXISTS)
         _migrate(conn)
         conn.execute("BEGIN IMMEDIATE")
         pid = sidecar["source"]["page_id"]
@@ -237,8 +443,8 @@ def upsert_page(db_path: Path | str | None, sidecar: dict) -> dict:
             "INSERT OR REPLACE INTO pages(page_id, case_id, case_short, "
             "page_number, image_path, image_sha256, width, height, status, "
             "line_count, extra_line_count, avg_confidence, processed_at, "
-            "provenance, error, collection, archive, fond, opis, delo) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "provenance, error, collection, archive, fond, opis, delo, "
+            "canonical_page_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pid, src.get("case_ref") or src.get("source_ref") or "unknown",
              src.get("case_short") or pid, int(src.get("page_number") or 0),
              src.get("image_path") or "", src.get("sha256") or "",
@@ -249,7 +455,8 @@ def upsert_page(db_path: Path | str | None, sidecar: dict) -> dict:
              rec.get("recognized_at"), json.dumps(provenance,
                                                   ensure_ascii=False),
              rec.get("error"), src.get("collection"), src.get("archive"),
-             src.get("fond"), src.get("opis"), src.get("delo")))
+             src.get("fond"), src.get("opis"), src.get("delo"),
+             dup_of if status == "duplicate" else None))
 
         for i, ln in enumerate(lines, start=1):
             x0, y0, x1, y1 = ln["bbox"]          # sidecar: xyxy
@@ -277,7 +484,7 @@ def upsert_page(db_path: Path | str | None, sidecar: dict) -> dict:
                  normalize(ln["text_raw"])))
 
         stats["lines"] = len(lines)
-        stats["reviews_remapped"], stats["reviews_dropped"] = \
+        stats["reviews_active"], stats["reviews_unresolved"] = \
             _remap_reviews_for_page(conn, pid)
         conn.commit()
     except Exception:
@@ -300,12 +507,52 @@ def iter_sidecars(sidecar_root: Path | None = None):
         yield p
 
 
+def _seed_reviews_from_store(conn, reviews_path: Path) -> dict:
+    """Materialize every durable review record into the view (idempotent).
+
+    Records whose page/line no longer matches stay in the table as
+    unresolved rows — never dropped.  Returns the record dict."""
+    from htr_reviews import load_records
+    cfg = {"reviews_path": str(reviews_path)}
+    records = load_records(cfg)
+    for rec in records.values():
+        row = conn.execute("SELECT review_id FROM reviews WHERE record_id=?",
+                           (rec.get("record_id"),)).fetchone()
+        if row:
+            continue
+        conn.execute(
+            "INSERT INTO reviews(record_id, line_id, page_id, line_number, "
+            "decision, verified_text, notes, source_sha256, case_id, "
+            "page_number, bbox, model_text, reviewer, updated_at, "
+            "image_sha256, recognition_revision, match_state, match_reason, "
+            "bbox_convention) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (rec.get("record_id"), None, rec.get("page_id", ""),
+             int(rec.get("line_number") or 0), rec["decision"],
+             rec.get("verified_text"), rec.get("notes"),
+             rec.get("image_sha256") or "", rec.get("case_id") or "unknown",
+             int(rec.get("page_number") or 0),
+             json.dumps(rec.get("bbox")) if rec.get("bbox") is not None
+             else None, rec.get("model_text"),
+             rec.get("reviewer", "local-human"), rec["updated_at"],
+             rec.get("image_sha256"), rec.get("recognition_revision"),
+             "unresolved", "pending_match",
+             rec.get("bbox_convention", "xyxy-original-image-pixels")))
+    return records
+
+
 def build(db_path: Path | str | None = None,
           sidecar_root: Path | str | None = None,
-          import_legacy: bool = True) -> dict:
-    """Full rebuild from portable sidecars (optionally importing legacy
-    artifacts first).  Preserves reviews via (page_id, line_number) remap."""
+          import_legacy: bool = True,
+          reviews_path: Path | str | None = None) -> dict:
+    """Full rebuild from portable sidecars + the durable review store.
+
+    Safe on a brand-new empty database: reviews are seeded from
+    `reviews.jsonl`, pages/lines from sidecars.  Deterministic for fixed
+    inputs.  Preserves every review (active or unresolved)."""
     db_path = Path(db_path) if db_path else DB_PATH
+    if reviews_path is None:
+        reviews_path = REVIEWS_PATH
+    reviews_path = Path(reviews_path)
     if import_legacy:
         try:
             from htr_import import legacy_to_sidecars
@@ -324,11 +571,19 @@ def build(db_path: Path | str | None = None,
                 (r["page"], r["line_number"], r.get("provisional_reference", ""),
                  r.get("reference_provenance", "none"),
                  1 if r.get("verified") else 0))
+    # P0: the durable store must contain every review the DB knows about
+    # before any rebuild touches the view (recovery from DB loss works too:
+    # an empty DB simply seeds from the store).
+    from htr_reviews import ingest_missing
+    ingested = ingest_missing({"reviews_path": str(reviews_path)}, conn)
+    records = _seed_reviews_from_store(conn, reviews_path)
+    conn.commit()
     conn.close()
 
     pages_ok = pages_failed = pages_dup = lines_total = 0
-    reviews_remapped = reviews_dropped = 0
+    reviews_active = reviews_unresolved = 0
     invalid: list[str] = []
+    present_pids: set[str] = set()      # pages with a sidecar file (any state)
     for sc_path in iter_sidecars(sidecar_root):
         try:
             sidecar = json.loads(sc_path.read_text(encoding="utf-8"))
@@ -336,13 +591,13 @@ def build(db_path: Path | str | None = None,
             invalid.append(str(sc_path))
             continue
         from htr_sidecar import validate_sidecar
+        present_pids.add(sidecar.get("source", {}).get("page_id", ""))
         problems = validate_sidecar(sidecar)
         if problems:
             invalid.append(f"{sc_path}: {problems[:3]}")
             continue
         st = upsert_page(db_path, sidecar)
-        reviews_remapped += st["reviews_remapped"]
-        reviews_dropped += st["reviews_dropped"]
+        reviews_unresolved += st["reviews_unresolved"]
         status = sidecar["recognition"].get("status", "ok")
         if status == "ok":
             pages_ok += 1
@@ -352,16 +607,58 @@ def build(db_path: Path | str | None = None,
         else:
             pages_failed += 1
 
+    # reviews whose page never made it into the index stay visible, flagged
     conn = connect(db_path)
+    # stale pages: rows whose sidecar no longer exists are pruned (a clean
+    # rebuild must not retain pages absent from the portable artifacts).
+    # Their reviews are NEVER deleted — they fall to page_missing below.
+    stale = [r["page_id"] for r in conn.execute(
+        "SELECT page_id FROM pages") if r["page_id"] not in present_pids]
+    pruned = 0
+    for pid in stale:
+        old_ids = [r["line_id"] for r in conn.execute(
+            "SELECT line_id FROM lines WHERE page_id=?", (pid,))]
+        _fts_delete(conn, old_ids)
+        conn.execute("DELETE FROM lines WHERE page_id=?", (pid,))
+        conn.execute("DELETE FROM pages WHERE page_id=?", (pid,))
+        pruned += 1
+    conn.execute(
+        "UPDATE reviews SET match_reason='page_missing' "
+        "WHERE match_state='unresolved' AND match_reason='pending_match' "
+        "AND page_id NOT IN (SELECT page_id FROM pages)")
+    # invariant: an ACTIVE review always points at a live line of a live
+    # page; anything orphaned by pruning becomes unresolved (never deleted)
+    conn.execute(
+        "UPDATE reviews SET line_id=NULL, match_state='unresolved', "
+        "match_reason='page_missing' WHERE match_state='active' AND "
+        "page_id NOT IN (SELECT page_id FROM pages)")
+    conn.execute(
+        "UPDATE reviews SET line_id=NULL, match_state='unresolved', "
+        "match_reason='line_missing' WHERE match_state='active' AND "
+        "line_id NOT IN (SELECT line_id FROM lines)")
     conn.execute("INSERT INTO lines_fts(lines_fts) VALUES('rebuild')")
     conn.execute("INSERT INTO lines_trgm(lines_trgm) VALUES('rebuild')")
     conn.commit()
+    counts = {r[0]: r[1] for r in conn.execute(
+        "SELECT match_state, COUNT(*) FROM reviews GROUP BY match_state")}
+    reviews_active = counts.get("active", 0)
+    reviews_unresolved = counts.get("unresolved", 0)
     have = {r["page_id"] for r in conn.execute("SELECT page_id FROM pages")}
+    orphans = conn.execute(
+        "SELECT COUNT(*) FROM lines l LEFT JOIN pages p USING(page_id) "
+        "WHERE p.page_id IS NULL").fetchone()[0]
+    fk_issues = conn.execute("PRAGMA foreign_key_check").fetchall()
     conn.close()
     return {"pages_ok": pages_ok, "pages_failed": pages_failed,
             "pages_duplicate": pages_dup, "lines": lines_total,
-            "reviews_remapped": reviews_remapped,
-            "reviews_dropped": reviews_dropped,
+            "reviews_total": reviews_active + reviews_unresolved,
+            "reviews_active": reviews_active,
+            "reviews_unresolved": reviews_unresolved,
+            "reviews_ingested_from_db": ingested,
+            "review_records_in_store": len(records),
+            "orphan_lines": orphans,
+            "foreign_key_issues": len(fk_issues),
+            "pages_pruned": pruned,
             "invalid_sidecars": invalid,
             "total_pages_in_db": len(have)}
 

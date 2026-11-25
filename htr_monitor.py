@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -48,6 +49,12 @@ def _db_stats(cfg) -> dict:
                 ("confirmed_reviews",
                  "SELECT COUNT(*) FROM reviews WHERE decision='confirmed'")):
             out[key] = conn.execute(sql).fetchone()[0]
+        try:
+            out["reviews_unresolved"] = conn.execute(
+                "SELECT COUNT(*) FROM reviews WHERE match_state='unresolved'"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            out["reviews_unresolved"] = None   # pre-P0 schema (not migrated yet)
         out["by_collection"] = {
             r[0]: r[1] for r in conn.execute(
                 "SELECT COALESCE(collection,'?'), COUNT(*) FROM pages "
@@ -295,6 +302,7 @@ def report(cfg: dict, as_json: bool = False, tail: int = 15) -> dict:
         "lines_by_collection": db.get("lines_by_collection"),
         "reviews": db.get("reviews"),
         "reviews_confirmed": db.get("confirmed_reviews"),
+        "reviews_unresolved": db.get("reviews_unresolved"),
         "sidecars": sidecars.get("count"),
         "recent_pages_per_hour": prog.get("recent_pages_per_hour"),
         "avg_pages_per_hour_measured": prog.get("avg_pages_per_hour_all"),
@@ -336,6 +344,9 @@ def report(cfg: dict, as_json: bool = False, tail: int = 15) -> dict:
     line("indexed lines", out["indexed_lines"])
     line("lines by collection", out["lines_by_collection"] or {})
     line("reviews (confirmed)", f"{out['reviews']} ({out['reviews_confirmed']})")
+    if out.get("reviews_unresolved") is not None:
+        line("reviews unresolved (historical)",
+             out["reviews_unresolved"])
     print("Throughput (measured)")
     line("recent pages/hour", out["recent_pages_per_hour"])
     line("historical avg pages/hour", out["avg_pages_per_hour_measured"])

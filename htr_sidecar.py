@@ -43,14 +43,55 @@ def xyxy_to_xywh(bbox: list) -> list:
     return [x0, y0, x1 - x0, y1 - y0]
 
 
+# Canonical token for the one patch this pipeline uses.  Historical provenance
+# strings label it either "bench-patch.diff (...)" or "polyscriptor-local.patch
+# (...)" while describing the IDENTICAL change; normalizing keeps recognition
+# configuration fingerprints comparable across legacy and new artifacts.
+PATCH_CANONICAL = "polyscriptor-local.patch@52524ed(min_height40->15,min_width16)"
+
+# Behaviour-determining configuration keys only.  Keys must be present in both
+# sidecar recognition blocks and DB pages.provenance JSON so a fingerprint can
+# be recomputed from either side (dedup compares them).
+FP_KEYS = ("engine", "model", "model_sha256", "segmentation",
+           "segmentation_sha256", "device", "patch")
+
+
+def normalize_patch(patch) -> str | None:
+    if patch is None:
+        return None
+    s = str(patch)
+    if any(t in s for t in ("min_height", "min line", "40->15",
+                            "bench-patch", "polyscriptor-local")):
+        return PATCH_CANONICAL
+    return s
+
+
 def config_fingerprint(recognition: dict) -> str:
-    """Stable sha256 over the recognition configuration (dedup key part)."""
-    keys = ("engine", "model", "model_sha256", "segmentation",
-            "segmentation_sha256", "patch", "device", "segmentation_method",
-            "model_preset")
-    payload = json.dumps({k: recognition.get(k) for k in sorted(keys)},
-                         ensure_ascii=False, sort_keys=True)
+    """Stable sha256 over the recognition configuration (dedup key part).
+
+    Only behaviour-determining keys; `patch` is normalized so legacy
+    provenance ("bench-patch.diff …") and new provenance
+    ("polyscriptor-local.patch …") fingerprint identically.
+    """
+    payload = json.dumps(
+        {k: (normalize_patch(recognition.get(k)) if k == "patch"
+             else recognition.get(k)) for k in sorted(FP_KEYS)},
+        ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def fingerprint_from_provenance(provenance: dict) -> str | None:
+    """Recompute the config fingerprint from a DB pages.provenance dict.
+
+    Returns None when required keys are absent (caller must then treat the
+    configuration as unknown — never as a dedup match).
+    """
+    if not isinstance(provenance, dict):
+        return None
+    missing = [k for k in FP_KEYS if k not in provenance]
+    if missing:
+        return None
+    return config_fingerprint(provenance)
 
 
 # ---------------------------------------------------------------- sidecar build
@@ -177,9 +218,17 @@ def write_sidecar(path: Path, sidecar: dict) -> None:
             if not keep.exists():
                 keep.write_text(json.dumps(old, ensure_ascii=False, indent=1),
                                 encoding="utf-8")
+            new_rev = rev + 1
             sidecar.setdefault("artifact_integrity", {})[
                 "previous_revision"] = rev
-            sidecar["recognition"]["revision"] = rev + 1
+            sidecar["recognition"]["revision"] = new_rev
+            # line ids are stable WITHIN a recognition revision: re-stamp them
+            # so ids always carry the revision the sidecar declares
+            # (otherwise a bumped revision would keep -r1- ids — inconsistent
+            # revision identifiers).
+            page_id = sidecar.get("source", {}).get("page_id", "")
+            for i, ln in enumerate(sidecar.get("lines", []), start=1):
+                ln["line_id"] = f"{page_id}-r{new_rev}-{i:04d}"
     atomic_write_json(path, sidecar)
 
 
