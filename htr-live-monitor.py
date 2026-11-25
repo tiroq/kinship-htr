@@ -116,6 +116,7 @@ class Checkpoints:
             if path not in self.cache or self.cache[path][0] != signature:
                 meta = read_json(path)
                 if not isinstance(meta, dict) or meta.get("page_id") != folder.name:
+                    self.cache.pop(path, None)
                     continue
                 self.cache[path] = (signature, meta)
         self.cache = {p: v for p, v in self.cache.items() if p in seen}
@@ -177,16 +178,21 @@ def read_events(path):
 
 def rates(events):
     # Use completed cycle wall times, not burst timestamps or inference-only time.
-    rounds = [e for e in events if e.get("event") == "round_timing"
-              and isinstance(e.get("loop_s"), (int, float)) and e["loop_s"] > 0]
-    completed = {(e.get("round_no"), e.get("ts")): e.get("finalize", {}).get("indexed")
-                 for e in events if e.get("event") == "round_finished"}
     samples = []
-    for e in rounds:
-        n = completed.get((e.get("round_no"), e.get("ts")))
-        # Adjacent events may straddle a second. Avoid assuming every page succeeded.
-        if isinstance(n, int) and n > 0:
-            samples.append((n, e["loop_s"]))
+    last = None
+    for e in events:
+        event = e.get("event")
+        if event == "daemon_started":
+            last = None
+        elif event == "round_finished":
+            last = e
+        elif event == "round_timing":
+            if last and last.get("round_no") == e.get("round_no"):
+                n = last.get("finalize", {}).get("indexed")
+                seconds = e.get("loop_s")
+                if isinstance(n, int) and n >= 0 and isinstance(seconds, (int, float)) and seconds > 0:
+                    samples.append((n, seconds))
+            last = None
     def rate(s):
         return 3600 * sum(n for n, _ in s) / sum(t for _, t in s) if s else None
     return rate(samples[-5:]), rate(samples)
@@ -245,6 +251,8 @@ def render(cfg, records, stable, rows, line_count, metas, events, tail,
     rate, historical = rates(events)
     eta = remaining * 3600 / rate if rate else None
     recent = operations(metas, rows, stable, tail)
+    recent_durations = [m[4] for m in recent if m[3] in ("INDEXED", "OCR OK") and isinstance(m[4], (float, int))]
+    average = sum(recent_durations) / len(recent_durations) if recent_durations else None
     round_start = daemon.get("updated_epoch")
     finished_in_round = sum(1 for m in metas.values()
                             if isinstance(round_start, (float, int))
@@ -259,9 +267,10 @@ def render(cfg, records, stable, rows, line_count, metas, events, tail,
         f"OCR ready, not indexed {number(total['ocr_ready'])} | lines in DB {number(line_count)}",
         f"Stable {number(total['stable'])} | pending {number(total['pending'])} | retry {number(total['retry'])} | "
         f"parked {number(total['parked'])} | unstable {number(total['discovered']-total['stable'])}",
-        f"Rate last 5 completed rounds: {f'{rate:.1f}/h' if rate else '-'} | "
-        f"all timed rounds: {f'{historical:.1f}/h' if historical else '-'} | "
+        f"Rate last 5 completed rounds: {f'{rate:.1f}/h' if rate is not None else '-'} | "
+        f"all timed rounds: {f'{historical:.1f}/h' if historical is not None else '-'} | "
         f"ETA known pending: {duration(eta)} (future downloads excluded)",
+        f"Recent OCR avg: {duration(average)} | completed page checkpoints are visible before DB commit",
         "",
         "SOURCES          PROGRESS                     KNOWN    INDEXED   OCR READY   PENDING    RETRY/PARKED",
     ]
