@@ -62,6 +62,26 @@ class Hit:
     neighbors: list = field(default_factory=list)
     review: dict | None = None
     provisional: str | None = None
+    # evidence classification (§ search results must distinguish these):
+    match_kind: str = ""            # exact-raw | exact-norm | fuzzy | human-verified
+    evidence_class: str = ""        # machine-raw | machine-normalized |
+    #                                machine-fuzzy | human-verified
+    lead_status: str = ""           # SECONDARY-LEAD | HUMAN-VERIFIED
+
+
+def classify_hit(h: Hit, query: str, qn: str) -> tuple[str, str, str]:
+    """Label a hit's evidence type.  Every machine reading is a
+    SECONDARY-LEAD; only a human-confirmed review decision is not."""
+    rev = h.review or {}
+    if rev.get("decision") == "confirmed":
+        return "human-verified", "human-verified", "HUMAN-VERIFIED"
+    raw = " ".join(h.text_raw.split()).casefold()
+    q = " ".join(query.split()).casefold()
+    if q and q in raw:
+        return "exact-raw", "machine-raw", "SECONDARY-LEAD"
+    if qn and qn in normalize(h.text_raw):
+        return "exact-norm", "machine-normalized", "SECONDARY-LEAD"
+    return "fuzzy", "machine-fuzzy", "SECONDARY-LEAD"
 
 
 class Searcher:
@@ -118,17 +138,32 @@ class Searcher:
                 break
         return out
 
-    def _line_rows(self, ids: set[int]) -> list[sqlite3.Row]:
+    def _line_rows(self, ids: set[int],
+                   filters: dict | None = None) -> list[sqlite3.Row]:
         if not ids:
             return []
         ids = sorted(ids)
         out = []
+        fsql, fparams = "", []
+        if filters:
+            clauses = []
+            for col, key in (("p.case_short", "case"),
+                             ("p.collection", "collection"),
+                             ("p.fond", "fond"), ("p.opis", "opis"),
+                             ("p.delo", "delo"), ("p.page_id", "page")):
+                val = filters.get(key)
+                if val:
+                    clauses.append(f"{col}=?")
+                    fparams.append(str(val))
+            if clauses:
+                fsql = " AND " + " AND ".join(clauses)
         for i in range(0, len(ids), 900):
             q = ",".join("?" * min(900, len(ids) - i))
             out.extend(self.conn.execute(
                 f"SELECT l.*, p.case_short, p.page_number, p.height, p.width "
                 f"FROM lines l JOIN pages p USING(page_id) "
-                f"WHERE l.line_id IN ({q})", ids[i:i + 900]).fetchall())
+                f"WHERE l.line_id IN ({q}){fsql}",
+                ids[i:i + 900] + fparams).fetchall())
         return out
 
     def _neighbors(self, page_id: str, bbox: list, y_center: float, k: int = 3):
@@ -162,10 +197,20 @@ class Searcher:
 
     def search_lines(self, query: str, variants: list[str] | None = None,
                      case: str | None = None, limit: int = 200,
-                     with_neighbors: bool = True) -> list[Hit]:
-        """Search individual OCR lines. `variants` may come from a profile;
+                     with_neighbors: bool = True,
+                     collection: str | None = None,
+                     fond: str | None = None, opis: str | None = None,
+                     delo: str | None = None, page: str | None = None,
+                     exact: bool = False) -> list[Hit]:
+        """Search individual OCR lines.  `variants` may come from a profile;
         defaults to the normalized query itself (fuzzy recall handles
-        1-3 character corruptions without enumerating them)."""
+        1-3 character corruptions without enumerating them).
+
+        Filters: case (short id), collection, fond/opis/delo (archival
+        refs, text match), page (full page_id).  exact=True keeps only
+        lines whose text contains the query after normalization (phrase
+        semantics over the normalized form).
+        """
         qn = normalize(query)
         if not qn:
             return []
@@ -173,7 +218,9 @@ class Searcher:
         vs = [v for v in dict.fromkeys(vs) if v] or [qn]
 
         cand = self._fts_candidates(vs) | self._trigram_candidates(vs)
-        rows = self._line_rows(cand)
+        filters = {"case": case, "collection": collection, "fond": fond,
+                   "opis": opis, "delo": delo, "page": page}
+        rows = self._line_rows(cand, filters)
 
         scored: list[Hit] = []
         vh = {v: None for v in vs}
@@ -183,6 +230,8 @@ class Searcher:
             text = row["text_norm"]
             if not text:
                 continue  # empty/unreadable OCR: no text evidence, never a hit
+            if exact and qn not in text:
+                continue  # phrase semantics over the normalized form
             best_s, best_v = 0.0, ""
             for v in vs:
                 s = fuzz.partial_ratio(v, text)
@@ -234,6 +283,8 @@ class Searcher:
         for h in scored:
             h.review = reviews.get(h.line_id)
             h.provisional = provs.get((h.page_id, h.line_number)) or None
+            h.match_kind, h.evidence_class, h.lead_status = classify_hit(
+                h, query, qn)
             if with_neighbors:
                 h.neighbors = self._neighbors_full(h.page_id, h.bbox)
         return scored
@@ -271,16 +322,18 @@ class Searcher:
         return out
 
     def search_multiline(self, query: str, case: str | None = None,
-                         limit: int = 100) -> dict:
+                         limit: int = 100, **filters) -> dict:
         """Multi-line query: each line searched separately, results merged
-        per page (page score = sum of best line scores per query line)."""
+        per page (page score = sum of best line scores per query line).
+        Extra keyword filters (collection/fond/opis/delo/page/exact) are
+        forwarded to every sub-search."""
         subqueries = [q for q in (line.strip() for line in query.splitlines())
                       if q.strip()]
         per_page: dict[str, dict] = {}
         for sq in subqueries:
             best_by_page: dict[str, Hit] = {}
             for h in self.search_lines(sq, case=case, limit=500,
-                                       with_neighbors=False):
+                                       with_neighbors=False, **filters):
                 cur = best_by_page.get(h.page_id)
                 if cur is None or h.total > cur.total:
                     best_by_page[h.page_id] = h
@@ -352,4 +405,7 @@ def hit_to_dict(h: Hit) -> dict:
         "neighbors": h.neighbors,
         "review": dict(h.review) if h.review else None,
         "provisional_reference": h.provisional,
+        "match_kind": h.match_kind,
+        "evidence_class": h.evidence_class,
+        "lead_status": h.lead_status,
     }

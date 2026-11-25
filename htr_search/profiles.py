@@ -210,7 +210,7 @@ PROFILES = {
         "type": "surname",
         "canonical": "Шамрай",
         "documented": ["Шамрай", "Шамрая", "Шамраю", "Шамраев", "Шамраевъ",
-                       "Шамраева", "Шамраевой"],
+                       "Шамраева", "Шамраевой", "Шамраи", "Шамраевы"],
         "documented_note": (
             "ГАВО ф.И-331 оп.3 д.611 (Христорождественская ц. слободы "
             "Михайловки, Богучарский уезд, 1907) search pass "
@@ -226,7 +226,7 @@ PROFILES = {
         "type": "name",
         "canonical": "Ефим",
         "documented": ["Ефим", "Ефима", "Ефиму", "Евфимий", "Евфимия",
-                       "Ефимий", "Ефимъ", "Евфимію"],
+                       "Ефимий", "Ефимъ", "Евфимъ", "Евфимію"],
         "documented_note": (
             "calendar baptismal name for P-0009 (family-reported birth "
             "01.04.1907; Julian/Gregorian reading open, see SHAMRAI-03 "
@@ -236,6 +236,24 @@ PROFILES = {
         "inflections_generated": ["ефимом", "евфимием", "ефимиею",
                                   "евфимию"],
         "corruption_stems": ["ефим", "евфим", "ефимий"],
+    },
+    "Михайловка": {
+        "type": "settlement",
+        "canonical": "Михайловка",
+        "documented": [
+            "Михайловка", "Михайловки", "Михайловке", "Михайловку",
+            "Михайловкой", "слободы Михайловки", "сл. Михайловка",
+        ],
+        "documented_note": (
+            "слобода/село Михайловка, Богучарский уезд — ГАВО ф.И331 оп.3 "
+            "д.597–620 (metric books) and ф.И18 оп.1 д.260/261 (revision "
+            "lists, лл. Михайловки per SHAMRAI-TORRENT-REPORT); forms "
+            "attested in torrent catalogue and GAVO acquisition metadata"),
+        "inflections_generated": [
+            "михайловки", "михайловке", "михайловку", "михайловкой",
+            "михайловск",
+        ],
+        "corruption_stems": ["михайловка", "михайловки"],
     },
 }
 

@@ -1,10 +1,22 @@
-"""Index builder: OCR per-page outputs -> SQLite + FTS5 (work/index/htr.db).
+"""Index builder: portable sidecars -> SQLite + FTS5 (unified searchable DB).
+
+The sidecar tree (htr_sidecar.py) is the portable source of truth; this
+module can rebuild the whole database from it without rerunning HTR:
+
+    python -m htr_search.db            # rebuild (also imports legacy pages)
+
+Legacy per-page artifacts (work/index/ocr/<page>/, pre-dating sidecars) are
+converted to sidecars first (htr_import.legacy_to_sidecars), so one command
+covers the full corpus.
 
 Diplomatic OCR text (text_raw) is never modified.  Normalized copies exist
-only in lines.text_norm and the FTS5 indexes.  Human review decisions live in
-`reviews`; AI-draft provisional references live in `provisional_refs` and are
-NEVER promoted to human ground truth (no code path writes provisional_refs
-content into reviews; verified_text comes exclusively from review POSTs).
+only in lines.text_norm and the FTS5 indexes.  Human review decisions live
+in `reviews` and are remapped by their stable (page_id, line_number) key on
+every rebuild/upsert — never discarded.  AI-draft provisional references
+live in `provisional_refs` and are NEVER promoted to human ground truth.
+
+`lines.bbox` stays [x, y, w, h] (historical server/UI consumers); sidecars
+store [x_min, y_min, x_max, y_max] — conversion is tested.
 """
 from __future__ import annotations
 
@@ -16,10 +28,22 @@ from pathlib import Path
 
 from .normalize import normalize
 
-BENCH = Path("/Users/mysterx/dev/kinship-htr-bench")
-OCR_ROOT = BENCH / "work" / "index" / "ocr"
-DB_PATH = BENCH / "work" / "index" / "htr.db"
-SELECTION = BENCH / "work" / "selection.json"          # AI-draft provisional refs
+try:
+    from htr_config import load as _load_config
+    _CFG = _load_config()
+    DB_PATH = Path(_CFG["db_path"])
+    SIDECAR_ROOT = Path(_CFG["sidecar_root"])
+    LEGACY_OCR_ROOT = Path(_CFG["legacy_ocr_root"])
+    LEGACY_MANIFEST = Path(_CFG["legacy_manifest"])
+except Exception:  # config unavailable (e.g. bare checkout) — historical defaults
+    BENCH = Path(__file__).resolve().parent.parent
+    DB_PATH = BENCH / "work" / "index" / "htr.db"
+    SIDECAR_ROOT = BENCH / "work" / "indexer" / "sidecars"
+    LEGACY_OCR_ROOT = BENCH / "work" / "index" / "ocr"
+    LEGACY_MANIFEST = BENCH / "work" / "index_manifest.json"
+
+SELECTION = DB_PATH.parent / ".." / "selection.json"  # AI-draft provisional refs
+SELECTION = SELECTION.resolve()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages(
@@ -30,6 +54,7 @@ CREATE TABLE IF NOT EXISTS pages(
   status TEXT NOT NULL,
   line_count INTEGER, extra_line_count INTEGER, avg_confidence REAL,
   processed_at TEXT, provenance TEXT, error TEXT,
+  collection TEXT, archive TEXT, fond TEXT, opis TEXT, delo TEXT,
   UNIQUE(case_short, page_number)
 );
 CREATE TABLE IF NOT EXISTS lines(
@@ -80,8 +105,11 @@ CREATE TABLE IF NOT EXISTS search_results(
 );
 """
 
+PAGE_EXTRA_COLS = ("collection", "archive", "fond", "opis", "delo")
 
-def connect(db_path: Path = DB_PATH, readonly: bool = False) -> sqlite3.Connection:
+
+def connect(db_path: Path | str | None = None, readonly: bool = False) -> sqlite3.Connection:
+    db_path = Path(db_path) if db_path else DB_PATH
     if readonly:
         uri = f"file:{db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
@@ -92,127 +120,250 @@ def connect(db_path: Path = DB_PATH, readonly: bool = False) -> sqlite3.Connecti
     return conn
 
 
-def build(db_path: Path = DB_PATH, ocr_root: Path = OCR_ROOT) -> dict:
-    conn = connect(db_path)
-    conn.executescript(SCHEMA)
-    # migrate: reviews.line_number was missing (remap-by-(page_id,line_number)
-    # expected it but never persisted it); backfill from lines BEFORE deletion
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(pages)")}
+    for col in PAGE_EXTRA_COLS:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE pages ADD COLUMN {col} TEXT")
+    # backfill from historical case_id conventions
+    conn.execute(
+        "UPDATE pages SET collection='cgamos-597', archive='ЦГА Москвы', "
+        "fond='597', opis='1', delo=substr(case_short,1,3) "
+        "WHERE collection IS NULL AND case_short GLOB '[0-9][0-9][0-9]'")
+    conn.execute(
+        "UPDATE pages SET collection='gavo', "
+        "archive='ГАВО (Государственный архив Воронежской области)', "
+        "fond='И331', opis='3', delo=substr(case_short,2) "
+        "WHERE collection IS NULL AND case_short GLOB 'g[0-9]*'")
     cols = {r[1] for r in conn.execute("PRAGMA table_info(reviews)")}
     if "line_number" not in cols:
         conn.execute("ALTER TABLE reviews ADD COLUMN line_number INTEGER")
         conn.execute(
             "UPDATE reviews SET line_number="
             "(SELECT line_number FROM lines WHERE lines.line_id = reviews.line_id)")
-        conn.commit()
-    # page dimensions come from the manifest (per-page meta.json has no dims)
-    manifest_dims = {}
-    for pid, (_p, _sha, w, h) in json.loads(
-            (BENCH / "work" / "index_manifest.json").read_text()).items():
-        manifest_dims[pid] = (w, h)
-    # keep human reviews across the rebuild: lines get new line_ids, so remap
-    # review rows by their stable (page_id, line_number) key
-    old_reviews = list(conn.execute("SELECT * FROM reviews"))
-    conn.execute("DELETE FROM lines")
-    conn.execute("DELETE FROM pages")
+    conn.commit()
 
-    pages_ok = pages_failed = lines_total = extra_total = 0
-    for pdir in sorted(ocr_root.glob("*/")):
-        pid = pdir.name
-        if pid.startswith("_tmp"):
-            continue
-        meta_p = pdir / "meta.json"
-        if not meta_p.exists():
-            continue  # page not yet processed (or interrupted) — counted absent
-        meta = json.loads(meta_p.read_text())
-        short = pid.split("-")[0]
-        tjson = pdir / "transcriptions" / f"{pid}.json"
-        page_lines = []
-        if meta.get("status") == "ok" and tjson.exists():
-            tj = json.loads(tjson.read_text())
-            for ln in tj.get("lines", []):
-                x, y, w, h = ln["bbox"]
-                page_lines.append((ln["line_number"], "blla-ocr", ln.get("text", ""),
-                                   json.dumps(ln["bbox"]), ln.get("confidence"),
-                                   y + h / 2.0))
-        extra = []
-        sb_p = pdir / "stage_b.json"
-        if sb_p.exists():
-            for ln in json.loads(sb_p.read_text()).get("lines", []):
-                x, y, w, h = ln["bbox"]
-                extra.append((ln["line_number"], "stage-b-gap", ln.get("text", ""),
-                              json.dumps(ln["bbox"]), ln.get("confidence"),
-                              y + h / 2.0))
 
-        if meta.get("status") == "ok":
-            pages_ok += 1
-        elif meta.get("status") == "failed":
-            pages_failed += 1
-        lines_total += len(page_lines)
-        extra_total += len(extra)
-        w_dim, h_dim = manifest_dims.get(pid, (meta.get("width"), meta.get("height")))
-        conn.execute(
-            "INSERT OR REPLACE INTO pages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (pid, meta["case_id"], short, meta["page_number"],
-             meta["image_path"], meta["image_sha256"], w_dim, h_dim,
-             meta.get("status", "unknown"),
-             len(page_lines), len(extra), meta.get("avg_confidence"),
-             meta.get("completed_at"),
-             json.dumps({k: meta[k] for k in (
-                 "engine", "model", "model_sha256", "segmentation",
-                 "patch", "device", "reused_from_benchmark") if k in meta},
-                 ensure_ascii=False),
-             meta.get("error")))
+# ---------------------------------------------------------------- helpers
 
-        order = 0
-        for num, src, text, bbox, conf, yc in page_lines + extra:
-            order += 1
+def _legacy_dims() -> dict:
+    """page_id -> (width, height) from the historical index manifest."""
+    out = {}
+    try:
+        for pid, (_p, _sha, w, h) in json.loads(
+                LEGACY_MANIFEST.read_text(encoding="utf-8")).items():
+            out[pid] = (w, h)
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    return out
+
+
+def _fts_delete(conn: sqlite3.Connection, line_ids: list[int]) -> None:
+    """Remove rows from the external-content FTS indexes (old values required)."""
+    if not line_ids:
+        return
+    for i in range(0, len(line_ids), 900):
+        chunk = line_ids[i:i + 900]
+        ph = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT line_id, text_norm FROM lines WHERE line_id IN ({ph})",
+            chunk).fetchall()
+        for r in rows:
             conn.execute(
-                "INSERT INTO lines(page_id,line_number,source,text_raw,text_norm,"
-                "bbox,confidence,reading_order,y_center) VALUES(?,?,?,?,?,?,?,?,?)",
-                (pid, num, src, text, normalize(text), bbox, conf, order, yc))
+                "INSERT INTO lines_fts(lines_fts, rowid, text_norm) "
+                "VALUES('delete', ?, ?)", (r["line_id"], r["text_norm"]))
+            conn.execute(
+                "INSERT INTO lines_trgm(lines_trgm, rowid, text_norm) "
+                "VALUES('delete', ?, ?)", (r["line_id"], r["text_norm"]))
 
+
+def _remap_reviews_for_page(conn: sqlite3.Connection, page_id: str) -> tuple[int, int]:
+    """Re-attach reviews of `page_id` to the current line_ids via the stable
+    (page_id, line_number) key.  Returns (remapped, dropped)."""
+    reviews = list(conn.execute("SELECT * FROM reviews WHERE page_id=?",
+                                (page_id,)))
+    remapped = dropped = 0
+    for r in reviews:
+        row = conn.execute(
+            "SELECT line_id FROM lines WHERE page_id=? AND line_number=?",
+            (page_id, r["line_number"])).fetchone()
+        if row and row["line_id"] != r["line_id"]:
+            conn.execute("UPDATE reviews SET line_id=? WHERE review_id=?",
+                         (row["line_id"], r["review_id"]))
+            remapped += 1
+        elif row is None:
+            # keep the review row orphan-free: park it is not allowed by the
+            # UNIQUE(FK) constraint semantics — drop and count honestly
+            conn.execute("DELETE FROM reviews WHERE review_id=?", (r["review_id"],))
+            dropped += 1
+    return remapped, dropped
+
+
+def upsert_page(db_path: Path | str | None, sidecar: dict) -> dict:
+    """Transactionally index one sidecar (idempotent per page_id).
+
+    Order inside one transaction: capture reviews -> FTS-delete old lines ->
+    delete lines/pages -> insert page+lines -> FTS-insert -> remap reviews.
+    A crash rolls the whole page back; search stays available (WAL).
+    """
+    conn = connect(db_path)
+    stats = {"page_id": sidecar["source"]["page_id"], "lines": 0,
+             "reviews_remapped": 0, "reviews_dropped": 0}
+    try:
+        _migrate(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        pid = sidecar["source"]["page_id"]
+        rec = sidecar["recognition"]
+        status = rec.get("status", "ok")
+        old_ids = [r["line_id"] for r in conn.execute(
+            "SELECT line_id FROM lines WHERE page_id=?", (pid,))]
+        _fts_delete(conn, old_ids)
+        conn.execute("DELETE FROM lines WHERE page_id=?", (pid,))
+
+        src = sidecar["source"]
+        img = sidecar["image"]
+        lines = sidecar["lines"] if status == "ok" else []
+        confs = [ln["confidence"] for ln in lines
+                 if ln.get("confidence") is not None]
+        provenance = {k: rec.get(k) for k in (
+            "engine", "model", "model_sha256", "segmentation",
+            "segmentation_sha256", "patch", "device", "origin",
+            "config_fingerprint", "revision", "import_validation",
+            "reused_from_benchmark") if rec.get(k) is not None}
+        dup_of = sidecar.get("content_group", {}).get("duplicate_of")
+        if dup_of:
+            provenance["duplicate_of"] = dup_of
+        conn.execute(
+            "INSERT OR REPLACE INTO pages(page_id, case_id, case_short, "
+            "page_number, image_path, image_sha256, width, height, status, "
+            "line_count, extra_line_count, avg_confidence, processed_at, "
+            "provenance, error, collection, archive, fond, opis, delo) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pid, src.get("case_ref") or src.get("source_ref") or "unknown",
+             src.get("case_short") or pid, int(src.get("page_number") or 0),
+             src.get("image_path") or "", src.get("sha256") or "",
+             img.get("width"), img.get("height"), status,
+             len(lines), sum(1 for ln in lines
+                             if ln.get("source") == "stage-b-gap"),
+             (sum(confs) / len(confs)) if confs else None,
+             rec.get("recognized_at"), json.dumps(provenance,
+                                                  ensure_ascii=False),
+             rec.get("error"), src.get("collection"), src.get("archive"),
+             src.get("fond"), src.get("opis"), src.get("delo")))
+
+        for i, ln in enumerate(lines, start=1):
+            x0, y0, x1, y1 = ln["bbox"]          # sidecar: xyxy
+            bbox_xywh = json.dumps([x0, y0, x1 - x0, y1 - y0])
+            conn.execute(
+                "INSERT INTO lines(page_id, line_number, source, text_raw, "
+                "text_norm, bbox, confidence, reading_order, y_center) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (pid, int(ln.get("line_number") or i),
+                 ln.get("source", "blla-ocr"), ln["text_raw"],
+                 ln.get("text_norm") or normalize(ln["text_raw"]),
+                 bbox_xywh, ln.get("confidence"),
+                 int(ln.get("reading_order") or i),
+                 y0 + (y1 - y0) / 2.0))
+            row = conn.execute(
+                "SELECT line_id FROM lines WHERE page_id=? AND line_number=?",
+                (pid, ln.get("line_number") or i)).fetchone()
+            conn.execute(
+                "INSERT INTO lines_fts(rowid, text_norm) VALUES(?,?)",
+                (row["line_id"], ln.get("text_norm") or
+                 normalize(ln["text_raw"])))
+            conn.execute(
+                "INSERT INTO lines_trgm(rowid, text_norm) VALUES(?,?)",
+                (row["line_id"], ln.get("text_norm") or
+                 normalize(ln["text_raw"])))
+
+        stats["lines"] = len(lines)
+        stats["reviews_remapped"], stats["reviews_dropped"] = \
+            _remap_reviews_for_page(conn, pid)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return stats
+
+
+# ---------------------------------------------------------------- build
+
+def iter_sidecars(sidecar_root: Path | None = None):
+    root = Path(sidecar_root) if sidecar_root else SIDECAR_ROOT
+    if not root.exists():
+        return
+    for p in sorted(root.rglob("*.htr.json")):
+        if "revisions" in p.parts:
+            continue
+        yield p
+
+
+def build(db_path: Path | str | None = None,
+          sidecar_root: Path | str | None = None,
+          import_legacy: bool = True) -> dict:
+    """Full rebuild from portable sidecars (optionally importing legacy
+    artifacts first).  Preserves reviews via (page_id, line_number) remap."""
+    db_path = Path(db_path) if db_path else DB_PATH
+    if import_legacy:
+        try:
+            from htr_import import legacy_to_sidecars
+            legacy_to_sidecars()
+        except ImportError:
+            pass  # htr_import not available: sidecars must already exist
+    conn = connect(db_path)
+    conn.executescript(SCHEMA)
+    _migrate(conn)
     # AI-draft provisional references (selection.json) — kept strictly separate
     if SELECTION.exists():
         conn.execute("DELETE FROM provisional_refs")
-        for r in json.loads(SELECTION.read_text()):
+        for r in json.loads(SELECTION.read_text(encoding="utf-8")):
             conn.execute(
                 "INSERT OR REPLACE INTO provisional_refs VALUES(?,?,?,?,?)",
                 (r["page"], r["line_number"], r.get("provisional_reference", ""),
                  r.get("reference_provenance", "none"),
                  1 if r.get("verified") else 0))
+    conn.close()
 
-    # remap surviving reviews onto the new line_ids (page_id + line_number)
-    conn.execute("DELETE FROM reviews")
-    remapped = dropped = 0
-    for r in old_reviews:
-        row = conn.execute(
-            "SELECT line_id FROM lines WHERE page_id=? AND line_number=?",
-            (r["page_id"], r["line_number"])).fetchone()
-        if row:
-            conn.execute(
-                "INSERT INTO reviews(line_id, page_id, line_number, decision, verified_text,"
-                " notes, source_sha256, case_id, page_number, bbox, model_text,"
-                " reviewer, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (row["line_id"], r["page_id"], r["line_number"], r["decision"],
-                 r["verified_text"], r["notes"], r["source_sha256"],
-                 r["case_id"], r["page_number"], r["bbox"], r["model_text"],
-                 r["reviewer"], r["updated_at"]))
+    pages_ok = pages_failed = pages_dup = lines_total = 0
+    reviews_remapped = reviews_dropped = 0
+    invalid: list[str] = []
+    for sc_path in iter_sidecars(sidecar_root):
+        try:
+            sidecar = json.loads(sc_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            invalid.append(str(sc_path))
+            continue
+        from htr_sidecar import validate_sidecar
+        problems = validate_sidecar(sidecar)
+        if problems:
+            invalid.append(f"{sc_path}: {problems[:3]}")
+            continue
+        st = upsert_page(db_path, sidecar)
+        reviews_remapped += st["reviews_remapped"]
+        reviews_dropped += st["reviews_dropped"]
+        status = sidecar["recognition"].get("status", "ok")
+        if status == "ok":
+            pages_ok += 1
+            lines_total += len(sidecar["lines"])
+        elif status == "duplicate":
+            pages_dup += 1
         else:
-            dropped += 1
+            pages_failed += 1
 
+    conn = connect(db_path)
     conn.execute("INSERT INTO lines_fts(lines_fts) VALUES('rebuild')")
     conn.execute("INSERT INTO lines_trgm(lines_trgm) VALUES('rebuild')")
     conn.commit()
-
-    # manifest coverage audit: pages expected vs present
-    manifest = json.loads((BENCH / "work" / "index_manifest.json").read_text())
     have = {r["page_id"] for r in conn.execute("SELECT page_id FROM pages")}
     conn.close()
-    missing = sorted(set(manifest) - have)
     return {"pages_ok": pages_ok, "pages_failed": pages_failed,
-            "lines_ocr": lines_total, "lines_extra": extra_total,
-            "reviews_remapped": remapped, "reviews_dropped": dropped,
-            "missing_from_index": missing}
+            "pages_duplicate": pages_dup, "lines": lines_total,
+            "reviews_remapped": reviews_remapped,
+            "reviews_dropped": reviews_dropped,
+            "invalid_sidecars": invalid,
+            "total_pages_in_db": len(have)}
 
 
 def main() -> int:
@@ -220,8 +371,6 @@ def main() -> int:
     stats = build()
     print(json.dumps(stats, ensure_ascii=False, indent=1))
     print(f"index built in {time.time() - t0:.1f}s -> {DB_PATH}")
-    if stats["missing_from_index"]:
-        print(f"WARNING: {len(stats['missing_from_index'])} pages not yet in index")
     return 0
 
 

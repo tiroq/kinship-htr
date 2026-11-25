@@ -40,6 +40,14 @@ def main() -> int:
     ap.add_argument("query")
     ap.add_argument("--profile", choices=list(PROFILES), default=None)
     ap.add_argument("--case", default=None, help="case short id: 253/255/256/258")
+    ap.add_argument("--collection", default=None,
+                    help="source collection filter: gavo/torrent/cgamos-597/…")
+    ap.add_argument("--fond", default=None, help="archival fond filter (e.g. И331, 597)")
+    ap.add_argument("--opis", default=None, help="archival opis filter")
+    ap.add_argument("--delo", default=None, help="archival delo filter")
+    ap.add_argument("--page", default=None, help="exact page_id filter")
+    ap.add_argument("--exact", action="store_true",
+                    help="phrase match on the normalized form only")
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--min-score", type=float, default=None)
     ap.add_argument("--multiline", action="store_true",
@@ -65,15 +73,26 @@ def main() -> int:
         variants = pv["all"]
         profile_name = ns.profile
 
+    filters = {}
+    for key in ("collection", "fond", "opis", "delo", "page"):
+        val = getattr(ns, key)
+        if val:
+            filters[key] = val
+    if ns.exact:
+        filters["exact"] = True
+
     if ns.multiline:
-        result = s.search_multiline(ns.query, case=ns.case, limit=ns.limit)
+        result = s.search_multiline(ns.query, case=ns.case, limit=ns.limit,
+                                    **filters)
         payload = {"query": ns.query, "profile": profile_name, "mode": "multiline",
+                   "filters": filters,
                    "pages": result["pages"],
                    "note": "page score = sum of best hit per query line"}
     else:
         hits = s.search_lines(ns.query, variants=variants, case=ns.case,
-                              limit=ns.limit)
+                              limit=ns.limit, **filters)
         payload = {"query": ns.query, "profile": profile_name,
+                   "filters": filters,
                    "variants_used": len(variants) if variants else 1,
                    "hits": [hit_to_dict(h) for h in hits],
                    "pages": [{"page_id": p["page_id"], "best": round(p["best"], 1),
@@ -82,8 +101,9 @@ def main() -> int:
 
     dt = time.time() - t0
     payload["elapsed_s"] = round(dt, 2)
-    payload["note"] = ("leads only — human visual verification required; "
-                       "no hits != absence")
+    payload["note"] = ("machine readings are SECONDARY-LEADs — human visual "
+                       "verification required; only review=confirmed lines "
+                       "are human-verified; no hits != absence")
 
     if ns.log_run and not ns.multiline:
         s.log_run(ns.query, profile_name, hits)
@@ -107,7 +127,8 @@ def main() -> int:
             print(f"{h['score']:6.1f} {h['page_id']} l{h['line_number']:>4} "
                   f"[{h['source']}] {h['text_raw'][:60]!r} "
                   f"text={h['components']['text']} ctx={h['components']['context']} "
-                  f"lay={h['components']['layout']} v={h['components']['matched_variant']!r}{rev}")
+                  f"lay={h['components']['layout']} v={h['components']['matched_variant']!r}"
+                  f" <{h['evidence_class']}/{h['lead_status']}>{rev}")
     n = len(payload.get("hits", payload.get("pages", [])))
     print(f"\n{n} result(s) in {dt:.1f}s  db={DB_PATH}")
     return 0

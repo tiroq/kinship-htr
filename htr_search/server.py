@@ -91,9 +91,9 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(r"^/api/line/(\d+)$", route)
             if m:
                 return self.api_line(int(m.group(1)))
-            m = re.match(r"^/api/image/([0-9]{3}-p[0-9]{3,})$", route)
+            m = re.match(r"^/api/image/([0-9A-Za-z._-]+)$", route)
             if m:
-                return self.api_image(m.group(1))
+                return self.api_image(m.group(1), self._q())
             m = re.match(r"^/api/crop/(\d+)$", route)
             if m:
                 return self.api_crop(int(m.group(1)), self._q())
@@ -113,8 +113,13 @@ class Handler(BaseHTTPRequestHandler):
         if q.get("profile") in PROFILES:
             variants = profile_variants(q["profile"])["all"]
         case = q.get("case") or None
+        filters = {}
+        for key in ("collection", "fond", "opis", "delo", "page"):
+            if q.get(key):
+                filters[key] = q[key]
+        filters["exact"] = q.get("exact") in ("1", "true", "yes")
         hits = s.search_lines(query, variants=variants, case=case,
-                              limit=int(q.get("limit", 100)))
+                              limit=int(q.get("limit", 100)), **filters)
         rf = q.get("review_filter")
         if rf == "reviewed":
             hits = [h for h in hits if h.review]
@@ -179,17 +184,37 @@ class Handler(BaseHTTPRequestHandler):
         return [rows[j] for j in range(max(0, idx - k),
                                        min(len(rows), idx + k + 1)) if j != idx]
 
-    def api_image(self, page_id: str):
+    def api_image(self, page_id: str, q: dict | None = None):
         conn = Searcher().conn
         row = conn.execute("SELECT image_path FROM pages WHERE page_id=?",
                            (page_id,)).fetchone()
+        highlight = None
+        if q and q.get("highlight"):
+            hrow = conn.execute(
+                "SELECT bbox, source FROM lines WHERE line_id=? AND page_id=?",
+                (int(q["highlight"]), page_id)).fetchone()
+            if hrow:
+                highlight = (json.loads(hrow["bbox"]), hrow["source"])
         conn.close()
         if not row:
             return self._json({"error": "no such page"}, 404)
         path = Path(row["image_path"])
         if not path.exists():
             return self._json({"error": "image missing"}, 404)
-        body = path.read_bytes()
+        if highlight:
+            # rectangle around the matched line on the ORIGINAL scan
+            from PIL import Image, ImageDraw
+            (x, y, w, h), source = highlight
+            img = Image.open(path).convert("RGB")
+            dr = ImageDraw.Draw(img)
+            color = (255, 60, 60) if source == "blla-ocr" else (60, 160, 255)
+            dr.rectangle([x - 4, y - 4, x + w + 4, y + h + 4],
+                         outline=color, width=6)
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=90)
+            body = buf.getvalue()
+        else:
+            body = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(body)))
