@@ -1,0 +1,31 @@
+diff --git a/batch_processing.py b/batch_processing.py
+index fa4df30..8e6068c 100644
+--- a/batch_processing.py
++++ b/batch_processing.py
+@@ -990,17 +990,20 @@ class BatchHTRProcessor:
+         # Extract line images (filter out too-small lines for CRNN-CTC)
+         line_images = []
+         filtered_lines = []
+-        # CRNN-CTC CNN needs minimum ~64px after resize to 128px height
+-        # Original height * (128 / original_height) >= 64  → original >= 64
+-        # But accounting for pooling layers, set conservative threshold
+-        min_height_for_cnn = 40  # Conservative minimum to avoid CNN dimension errors
++        # CRNN-CTC input is resized to 128px height, so small line heights are safe;
++        # the real constraint is the CNN width after pooling (needs >= 16px raw width).
++        # BENCH-PATCH (KINSHIP-HTR-BENCH-01): threshold 40 -> 15 (confessional-table
++        # handwriting is 30-35px tall; the stock filter dropped ~70% of blla lines),
++        # plus width guard to avoid the max_pool2d "output size too small" error.
++        min_height_for_cnn = 15
++        min_width_for_cnn = 16
+ 
+         for line in lines:
+             x, y, w, h = line.bbox
+ 
+             # Skip lines that are too small for CNN
+-            if h < min_height_for_cnn:
+-                self.logger.debug(f"  Skipping line with height {h}px (too small for CNN)")
++            if h < min_height_for_cnn or w < min_width_for_cnn:
++                self.logger.debug(f"  Skipping line {w}x{h}px (too small for CNN)")
+                 continue
+ 
+             # Use the already-cropped PIL image from LineSegment (better quality than re-cropping)

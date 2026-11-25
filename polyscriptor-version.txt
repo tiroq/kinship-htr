@@ -1,0 +1,6 @@
+Repository:
+https://github.com/achimrabus/polyscriptor.git
+Commit:
+52524ed1f7b32c3b983e6533c442cbe197e34fb0
+Working tree:
+ M batch_processing.py

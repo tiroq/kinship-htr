@@ -1,0 +1,17 @@
+coremltools==9.0
+huggingface_hub==1.16.1
+kraken==7.1.1
+numpy==2.4.6
+opencv-python-headless==5.1.0.95
+pillow==13.0.0
+safetensors==0.7.0
+scikit-image==0.25.2
+scikit-learn==1.7.2
+torch==2.14.0
+torchmetrics==1.9.0
+torchvision==0.29.2
+transformers==5.12.1
+crnn-ctc-russian/best_model.pt sha256=74482bd0eb8e33b25a197d0452559b888809dd0ae4e014274301a513f553dd32 bytes=43375364
+crnn-ctc-russian/symbols.txt sha256=2d205bc2214670245eb624112022a153a34fc1c851c0ef45d9c82c7191046716 bytes=663
+crnn-ctc-russian/model_config.json sha256=5f996e45639d798e35073a761c67aa5c6b4e1c270a46a9e15909a82bd596fa1d bytes=736
+polyscriptor/pagexml/blla.mlmodel sha256=77a638a83c9e535620827a09e410ed36391e9e8e8126d5796a0f15b978186056

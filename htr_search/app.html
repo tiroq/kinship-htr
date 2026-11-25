@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>HTR Search — kinship review</title>
+<style>
+:root{--fg:#1d1d1f;--muted:#6e6e73;--border:#d2d2d7;--surface:#f5f5f7;
+--accent:#0066cc;--ok:#1a7f37;--bad:#c62828;--maybe:#b58900;}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 -apple-system,"Segoe UI",Roboto,sans-serif;color:var(--fg)}
+header{padding:10px 16px;border-bottom:1px solid var(--border);background:var(--surface);
+display:flex;gap:8px;flex-wrap:wrap;align-items:center;position:sticky;top:0;z-index:5}
+header b{margin-right:6px}
+input[type=text],select{padding:5px 8px;border:1px solid var(--border);border-radius:6px;font-size:14px}
+button{padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:#fff;cursor:pointer;font-size:14px}
+button:hover{background:var(--surface)}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+main{display:grid;grid-template-columns:minmax(340px,46%) 1fr;gap:0;height:calc(100vh - 53px)}
+#left{overflow-y:auto;border-right:1px solid var(--border);padding:10px}
+#right{overflow-y:auto;padding:12px}
+.pg{border:1px solid var(--border);border-radius:8px;margin-bottom:10px;overflow:hidden}
+.pg>h3{margin:0;padding:6px 10px;background:var(--surface);font-size:13px;display:flex;justify-content:space-between}
+.hit{padding:6px 10px;border-top:1px solid var(--border);cursor:pointer}
+.hit:hover,.hit.sel{background:#e8f1fb}
+.hit .txt{font-family:Menlo,Consolas,monospace;font-size:13px}
+.hit .meta{color:var(--muted);font-size:12px;margin-top:2px;display:flex;gap:10px;flex-wrap:wrap}
+.badge{font-size:11px;padding:1px 6px;border-radius:8px;border:1px solid var(--border);color:var(--muted)}
+.badge.num{background:#fff8e1;border-color:#e6c200;color:#7a6300}
+.badge.rev-ok{color:var(--ok);border-color:var(--ok)}
+.badge.rev-bad{color:var(--bad);border-color:var(--bad)}
+.badge.rev-mb{color:var(--maybe);border-color:var(--maybe)}
+.badge.gap{background:#eef;color:var(--accent)}
+#detail h2{margin:4px 0 8px;font-size:16px}
+.cropwrap,.fullwrap{position:relative;display:inline-block;max-width:100%}
+.cropwrap img,.fullwrap img{max-width:100%;display:block;border:1px solid var(--border)}
+.bbox{position:absolute;border:2px solid var(--bad);pointer-events:none}
+.bbox.nb{border-color:rgba(0,102,204,.55);border-width:1px}
+.bbox.hit{border-color:#e6c200}
+.cropcap{color:var(--muted);font-size:12px;margin:2px 0 10px}
+table.nbr{border-collapse:collapse;width:100%;font-size:12.5px;margin:6px 0 14px}
+table.nbr td,table.nbr th{border:1px solid var(--border);padding:3px 7px;text-align:left}
+table.nbr td.t{font-family:Menlo,monospace}
+textarea{width:100%;min-height:54px;padding:6px;border:1px solid var(--border);border-radius:6px;font-family:Menlo,monospace}
+.decide{display:flex;gap:8px;margin:8px 0}
+.decide button[data-d=confirmed]{color:var(--ok);border-color:var(--ok)}
+.decide button[data-d=rejected]{color:var(--bad);border-color:var(--bad)}
+.decide button[data-d=uncertain]{color:var(--maybe);border-color:var(--maybe)}
+.saved{color:var(--ok);font-size:12px}
+.comp{background:var(--surface);border-radius:6px;padding:6px 10px;font-size:12.5px;margin:6px 0}
+.prov{background:#fff4e5;border:1px dashed #e6a23c;border-radius:6px;padding:6px 10px;font-size:12.5px;margin:6px 0}
+.prov b{color:#8a5a00}
+.legend{color:var(--muted);font-size:11.5px;margin-top:10px}
+#stats{font-size:12px;color:var(--muted)}
+a{color:var(--accent)}
+.empty{color:var(--muted);padding:20px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <b>HTR Search</b>
+  <input type="text" id="q" placeholder="Волченки / Протасьево / Головкин …" style="min-width:220px">
+  <select id="profile"><option value="">— профиль —</option></select>
+  <select id="case"><option value="">все дела</option><option>253</option><option>255</option><option>256</option><option>258</option></select>
+  <select id="revf"><option value="">все</option><option value="unreviewed">не просмотрено</option><option value="reviewed">просмотрено</option><option value="confirmed">подтверждено</option></select>
+  <select id="limit"><option>50</option><option selected>100</option><option>300</option></select>
+  <button class="primary" id="go">Искать</button>
+  <span id="stats"></span>
+  <span style="flex:1"></span>
+  <a id="expj" href="#">export JSON</a> <a id="expc" href="#">export CSV</a>
+</header>
+<main>
+<div id="left"><div class="empty">Введите запрос. Каждый найденный фрагмент — наводка для визуальной проверки, не вывод. Отсутствие совпадений — не доказательство отсутствия упоминаний.</div></div>
+<div id="right"><div class="empty">Выберите результат слева — откроется вырезка с координатной рамкой, оригинал страницы, соседи и форма проверки.</div></div>
+</main>
+<script>
+"use strict";
+const $=s=>document.querySelector(s);
+let curHit=null;
+
+function esc(s){return (s??'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function numericTag(t){return /^[\d\s.,:;\-—]+$/.test((t||'').trim())}
+
+async function api(path,opts){const r=await fetch(path,opts);if(!r.ok)throw new Error(await r.text());return r.json()}
+
+async function loadProfiles(){
+  const p=await api('/api/profiles');
+  for(const name of Object.keys(p)){
+    const o=document.createElement('option');o.value=name;
+    o.textContent=`${name} (${p[name].documented.length} док. + ${p[name].generated.length} ген.)`;
+    $('#profile').appendChild(o);
+  }
+}
+async function loadStats(){
+  const s=await api('/api/stats');
+  $('#stats').textContent=`страниц ${s.pages} (ok ${s.pages_ok}, fail ${s.pages_failed}) · строк ${s.lines} (+${s.lines_stage_b} gap) · проверок ${s.reviews}`;
+}
+
+async function doSearch(){
+  const q=$('#q').value.trim(); if(!q)return;
+  const u=new URLSearchParams({q,profile:$('#profile').value,case:$('#case').value,
+    review_filter:$('#revf').value,limit:$('#limit').value});
+  const d=await api('/api/search?'+u);
+  $('#expj').href='/api/export?format=json'; $('#expc').href='/api/export?format=csv';
+  renderResults(d);
+}
+
+function renderResults(d){
+  const L=$('#left');
+  if(!d.pages.length){L.innerHTML='<div class="empty">Ничего не найдено. Это НЕ доказательство отсутствия: OCR мог не распознать текст. См. отчёт о покрытии.</div>';return}
+  let h=`<div class="legend" style="margin:0 0 8px">score = 1.0·text + 0.25·0.6·context + 0.2·layout (+conf ≤3). text — лучшее partial_ratio по вариантам запроса.</div>`;
+  for(const pg of d.pages){
+    h+=`<div class="pg"><h3>${esc(pg.page_id)} <span>score ${pg.best.toFixed(1)} · фрагментов ${pg.hits.length}</span></h3>`;
+    for(const hit of pg.hits){
+      const cls=['badge'];
+      if(hit.source==='stage-b-gap')cls.push('gap');
+      if(numericTag(hit.text_raw))cls.push('num');
+      let rev='';
+      if(hit.review){cls.push('rev-'+(hit.review.decision==='confirmed'?'ok':hit.review.decision==='rejected'?'bad':'mb'));
+        rev=` <span class="${cls.at(-1)}">${hit.review.decision}</span>`}
+      h+=`<div class="hit" data-lid="${hit.line_id}">
+        <div class="txt">${esc(hit.text_raw)} <span class="${cls.join(' ')}">${numericTag(hit.text_raw)?'числ.':''}${hit.source==='stage-b-gap'?'gap':''}</span>${rev}</div>
+        <div class="meta"><span>score ${hit.score.toFixed(1)}</span><span>text ${hit.components.text}</span>
+        <span>ctx ${hit.components.context}</span><span>lay ${hit.components.layout}</span>
+        <span>v=${esc(hit.components.matched_variant)}</span><span>conf ${hit.confidence==null?'—':hit.confidence.toFixed(2)}</span></div></div>`;
+    }
+    h+='</div>';
+  }
+  L.innerHTML=h;
+  L.querySelectorAll('.hit').forEach(el=>el.onclick=()=>showLine(+el.dataset.lid));
+}
+
+async function showLine(lid){
+  document.querySelectorAll('.hit.sel').forEach(e=>e.classList.remove('sel'));
+  const el=document.querySelector(`.hit[data-lid="${lid}"]`);if(el)el.classList.add('sel');
+  const d=await api('/api/line/'+lid);
+  const l=d.line,bbox=JSON.parse(l.bbox);
+  curHit=d;
+  const imgURL=`/api/image/${l.page_id}`, cropURL=`/api/crop/${lid}?pad=140`;
+  const pad=140, ox=Math.max(0,bbox[0]-pad), oy=Math.max(0,bbox[1]-pad);
+  const img=new Image();img.src=imgURL;img.onload=()=>drawFull(img,d,bbox);
+  let h=`<h2>${esc(l.page_id)} · строка ${l.line_number} <span class="badge">${l.source}</span></h2>
+  <div class="cropwrap"><img id="crop" src="${cropURL}" alt="crop">
+    <div class="bbox" style="left:${bbox[0]-ox}px;top:${bbox[1]-oy}px;width:${bbox[2]}px;height:${bbox[3]}px"></div></div>
+  <div class="cropcap">вырезка +140px контекста (координаты ${bbox.join(', ')})</div>
+  <table class="nbr"><tr><th>#</th><th>текст OCR</th><th>conf</th><th>источник</th></tr>
+   <tr><td>${l.line_number}</td><td class="t"><b>${esc(l.text_raw)}</b></td><td>${l.confidence==null?'—':l.confidence.toFixed(3)}</td><td>${l.source}</td></tr>`;
+  for(const n of d.neighbors){
+    h+=`<tr style="cursor:pointer" data-lid="${n.line_id}"><td>${n.line_number}</td><td class="t">${esc(n.text_raw)}${numericTag(n.text_raw)?' <span class="badge num">числ.</span>':''}</td><td>${n.confidence==null?'—':n.confidence.toFixed(3)}</td><td>${n.source}</td></tr>`;
+  }
+  h+='</table>';
+  if(d.provisional_reference){
+    h+=`<div class="prov"><b>Проект ссылки (AI-черновик, НЕ проверено):</b> ${esc(d.provisional_reference.text)}
+     <div>${esc(d.provisional_reference.provenance)}</div>
+     <div>Этот черновик никогда не попадает в проверенный текст автоматически.</div></div>`;
+  }
+  const r=d.review;
+  h+=`<div class="comp">Проверка: ${r?esc(r.decision)+' · '+esc(r.updated_at):'ещё не проверено'}</div>
+  <label>Проверенная расшифровка (человеческая, дипломатическая)<textarea id="vt">${esc(r?r.verified_text||'':'')}</textarea></label>
+  <label>Заметки рецензента<br><textarea id="notes" style="min-height:34px">${esc(r?r.notes||'':'')}</textarea></label>
+  <div class="decide">
+    <button data-d="confirmed">✓ подтверждено</button>
+    <button data-d="rejected">✗ отвергнуто</button>
+    <button data-d="uncertain">? неопределённо</button>
+    <span class="saved" id="saved"></span></div>
+  <div class="fullwrap" id="fullwrap"></div>
+  <div class="cropcap">оригинал ${esc(l.page_id)} — полный скан, красная рамка = строка, голубые = соседи; клик по голубой рамке переключает строку</div>
+  <div class="legend">Решения сохраняются в SQLite на сервере и переживают перезагрузку. Подтверждение требует непустой проверенный текст; экспорт содержит SHA-256 источника, дело, страницу, координаты, текст, статус и время.</div>`;
+  $('#right').innerHTML=h;
+  document.querySelectorAll('#right table.nbr tr[data-lid]').forEach(tr=>tr.onclick=()=>showLine(+tr.dataset.lid));
+  document.querySelectorAll('.decide button[data-d]').forEach(b=>b.onclick=()=>saveReview(b.dataset.d));
+}
+
+function drawFull(img,d,bbox){
+  const wrap=$('#fullwrap');if(!wrap)return;
+  const W=Math.min(1000,img.width),scale=W/img.width;
+  let h=`<img src="${img.src}" style="width:${W}px">
+   <div class="bbox" style="left:${bbox[0]*scale}px;top:${bbox[1]*scale}px;width:${bbox[2]*scale}px;height:${bbox[3]*scale}px"></div>`;
+  for(const n of d.neighbors){
+    const b=JSON.parse(n.bbox);
+    h+=`<div class="bbox nb hitnb" data-lid="${n.line_id}" style="left:${b[0]*scale}px;top:${b[1]*scale}px;width:${b[2]*scale}px;height:${b[3]*scale}px;pointer-events:auto;cursor:pointer"></div>`;
+  }
+  wrap.innerHTML=h;
+  wrap.querySelectorAll('.hitnb').forEach(el=>el.onclick=()=>showLine(+el.dataset.lid));
+}
+
+async function saveReview(decision){
+  const vt=$('#vt').value.trim();
+  if(decision==='confirmed'&&!vt){$('#saved').textContent='для подтверждения нужен проверенный текст';return}
+  const body={line_id:curHit.line.line_id,decision,verified_text:vt,notes:$('#notes').value};
+  const r=await fetch('/api/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const d=await r.json();
+  $('#saved').textContent=d.ok?'сохранено ✓ '+new Date().toLocaleTimeString():('ошибка: '+(d.error||''));
+  loadStats();
+}
+
+$('#go').onclick=doSearch;
+$('#q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
+$('#expj').onclick=e=>{e.preventDefault();location.href='/api/export?format=json'};
+$('#expc').onclick=e=>{e.preventDefault();location.href='/api/export?format=csv'};
+loadProfiles();loadStats();
+</script>
+</body>
+</html>
