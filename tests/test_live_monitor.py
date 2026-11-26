@@ -22,6 +22,14 @@ assert total["indexed"] == 1 and total["duplicate"] == 1
 assert total["ocr_ready"] == 1 and total["pending"] == 1
 assert total["retry"] == 1 and total["parked"] == 1
 assert total["stable"] == total["discovered"] == 6
+# A live page moves out of the pending/retry bucket, not into a second count.
+assert m.pipeline_counts(total, "d", stable, rows, meta, 3) == (0, 1, 1)
+assert m.pipeline_counts(total, "e", stable, rows, meta, 3) == (1, 0, 1)
+assert m.pipeline_counts(total, "c", stable, rows, meta, 3) == (1, 1, 0)
+assert m.pipeline_counts(total, "f", stable, rows, meta, 3) == (1, 1, 0)
+assert m.pipeline_counts(total, None, stable, rows, meta, 3) == (1, 1, 0)
+assert m.fit("12345", 4) == "123…"
+
 assert sum(total[k] for k in ("indexed", "duplicate", "ocr_ready", "pending", "retry", "parked")) == 6
 
 events = [
@@ -49,13 +57,14 @@ with tempfile.TemporaryDirectory() as tmp:
     result = cache.scan()
     assert result["c"]["status"] == "ok"
     op = m.operations(result, rows, stable, 10)[0]
-    assert op[3] == "OCR OK" and op[5] == 14
+    assert op[3] == "WAIT DB" and op[5] == 14
     assert m.operations(result, {"c": ("ok", 14)}, stable, 10)[0][3] == "INDEXED"
+    assert m.operations(result, {"c": ("duplicate", 0)}, stable, 10)[0][3] == "ALIAS"
     p.unlink()
     assert cache.scan() == {}
 # Same color semantics as GAVO; plain output stays pipe-friendly.
 assert m.state_color("INDEXED") == m.GREEN
-assert m.state_color("OCR OK") == m.CYAN
+assert m.state_color("WAIT DB") == m.CYAN
 assert m.state_color("FAILED") == m.RED
 assert m.elapsed_color(2, 20) == m.GREEN
 assert m.elapsed_color(6, 20) == m.YELLOW
