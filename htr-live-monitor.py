@@ -20,6 +20,41 @@ from pathlib import Path
 
 from htr_config import load as load_config
 
+RESET = "\033[0m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+ORANGE = "\033[38;5;208m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+GRAY = "\033[90m"
+BOLD = "\033[1m"
+
+COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+
+
+def paint(value, color):
+    return f"{color}{value}{RESET}" if COLOR else str(value)
+
+
+def state_color(state):
+    if state in ("INDEXED", "CHECKPOINT SAVED"):
+        return GREEN
+    if state in ("OCR OK", "RECOGNIZING"):
+        return CYAN
+    if state in ("IDLE / DISCOVERY",):
+        return GRAY
+    if state == "FAILED" or state.startswith(("STOPPED", "STALE")):
+        return RED
+    return YELLOW
+
+
+def elapsed_color(seconds, peak):
+    # Same relative time scale as GAVO Queue Monitor.
+    if not isinstance(seconds, (int, float)) or peak <= 0:
+        return GRAY
+    ratio = seconds / peak
+    return GREEN if ratio < .25 else YELLOW if ratio < .5 else ORANGE if ratio < .75 else RED
+
 
 def read_json(path):
     try:
@@ -52,7 +87,7 @@ def duration(value):
 def bar(done, total, width=24):
     fraction = min(1, max(0, done / total)) if total else 0
     n = int(fraction * width)
-    return "[" + "#" * n + "-" * (width - n) + f"] {fraction:6.1%}"
+    return paint("█" * n, GREEN) + paint("░" * (width - n), GRAY) + f" {fraction:6.1%}"
 
 
 def number(value):
@@ -253,23 +288,26 @@ def render(cfg, records, stable, rows, line_count, metas, events, tail,
     recent = operations(metas, rows, stable, tail)
     recent_durations = [m[4] for m in recent if m[3] in ("INDEXED", "OCR OK") and isinstance(m[4], (float, int))]
     average = sum(recent_durations) / len(recent_durations) if recent_durations else None
+    peak = max(recent_durations, default=0)
     round_start = daemon.get("updated_epoch")
     finished_in_round = sum(1 for m in metas.values()
                             if isinstance(round_start, (float, int))
                             and (epoch(m.get("completed_at")) or 0) >= int(round_start))
     # index/total is provided only on phase=page; do not guess after a respawn.
     out = [
-        f"HTR LIVE MONITOR   {clock(now)}   {status}",
+        paint("HTR LIVE MONITOR", BOLD + CYAN) + f"   {clock(now)}   " + paint(status, state_color(status)),
         "=" * width,
         f"CORPUS  {bar(recognized, total['discovered'])}  "
         f"{number(recognized)}/{number(total['discovered'])} recognized/resolved",
-        f"Indexed OK {number(total['indexed'])} | aliases {number(total['duplicate'])} | "
-        f"OCR ready, not indexed {number(total['ocr_ready'])} | lines in DB {number(line_count)}",
-        f"Stable {number(total['stable'])} | pending {number(total['pending'])} | retry {number(total['retry'])} | "
-        f"parked {number(total['parked'])} | unstable {number(total['discovered']-total['stable'])}",
+        f"Indexed OK {paint(number(total['indexed']), GREEN)} | aliases {number(total['duplicate'])} | "
+        f"OCR ready, not indexed {paint(number(total['ocr_ready']), CYAN)} | lines in DB {number(line_count)}",
+        f"Stable {number(total['stable'])} | pending {paint(number(total['pending']), GRAY)} | "
+        f"retry {paint(number(total['retry']), YELLOW if total['retry'] else GREEN)} | "
+        f"parked {paint(number(total['parked']), RED if total['parked'] else GREEN)} | "
+        f"unstable {number(total['discovered']-total['stable'])}",
         f"Rate last 5 completed rounds: {f'{rate:.1f}/h' if rate is not None else '-'} | "
         f"all timed rounds: {f'{historical:.1f}/h' if historical is not None else '-'} | "
-        f"ETA known pending: {duration(eta)} (future downloads excluded)",
+        f"ETA known pending: {paint(duration(eta), CYAN)} (future downloads excluded)",
         f"Recent OCR avg: {duration(average)} | completed page checkpoints are visible before DB commit",
         "",
         "SOURCES          PROGRESS                     KNOWN    INDEXED   OCR READY   PENDING    RETRY/PARKED",
@@ -279,37 +317,45 @@ def render(cfg, records, stable, rows, line_count, metas, events, tail,
         out.append(f"{source:<16} {bar(n,c['discovered'],16)} "
                    f"{c['discovered']:>7,} {c['indexed']+c['duplicate']:>10,} "
                    f"{c['ocr_ready']:>11,} {c['pending']:>9,} {c['retry']:>6,}/{c['parked']:<6,}")
-    out += ["", "CURRENT WORKER",
+    out += ["-" * width, paint("CURRENT WORKER", BOLD + CYAN),
             f"Daemon {parent_pid or '-'} | heartbeat {duration(daemon_age)} (per round) | "
             f"child {child_pid if child_alive else '-'} | heartbeat {duration(age)}"]
     if child_alive:
         out.append(f"CPU {worker['cpu']:.1f}% | RSS {worker['rss_mib']:.0f} MiB | "
-                   f"phase {phase or '-'} | page {page or '-'}")
+                   f"phase {paint(phase or '-', state_color(status))} | page {paint(page or '-', CYAN)}")
         if phase == "page":
             idx, count = child.get("index"), child.get("total")
-            out.append(f"Slice page {idx or '-'}/{count or '-'} | "
-                       f"current page elapsed {duration(age)} | "
-                       f"completed checkpoints this round {finished_in_round}")
+            out.append(f"Slice page {paint(f'{idx or "-"}/{count or "-"}', CYAN)} | "
+                       f"current page elapsed {paint(duration(age), elapsed_color(age, peak))} | "
+                       f"completed checkpoints this round {paint(finished_in_round, GREEN)}")
     try:
         free = shutil.disk_usage(cfg["runtime_root"]).free / 2**30
-        out.append(f"Runtime disk free {free:.1f} GiB | safety floor {cfg.get('min_free_gb', '?')} GiB")
+        floor = cfg.get("min_free_gb", 5)
+        disk_color = RED if free < floor else YELLOW if free < 2 * floor else GREEN
+        out.append(f"Runtime disk free {paint(f'{free:.1f} GiB', disk_color)} | safety floor {floor} GiB")
     except OSError:
         out.append("Runtime disk unavailable")
-    out += ["", "RECENT OPERATIONS  (actual HTR completion time, not batch index time)",
+    out += ["-" * width, paint("RECENT OPERATIONS", BOLD + CYAN) + "  (actual HTR completion time, not batch index time)",
             "TIME      PAGE                         SOURCE          STATUS       TOTAL    LINES   CONF"]
     for stamp, pid, source, state, elapsed, lines, confidence, error in recent:
         conf = f"{confidence:.3f}" if isinstance(confidence, (int,float)) else "-"
-        out.append(f"{clock(stamp):<9} {pid:<28} {source:<15} {state:<11} "
-                   f"{duration(elapsed):>8} {number(lines):>7} {conf:>6}"
+        out.append(f"{clock(stamp):<9} {pid:<28} {source:<15} {paint(f'{state:<11}', state_color(state))} "
+                   f"{paint(f'{duration(elapsed):>8}', elapsed_color(elapsed, peak))} {number(lines):>7} {conf:>6}"
                    + (f"  {str(error)[:80]}" if error else ""))
+    if peak > 0:
+        out.append("TIME SCALE (recent pages): " + " | ".join((
+            paint(f"0-{peak*.25:.1f}s", GREEN),
+            paint(f"{peak*.25:.1f}-{peak*.5:.1f}s", YELLOW),
+            paint(f"{peak*.5:.1f}-{peak*.75:.1f}s", ORANGE),
+            paint(f"{peak*.75:.1f}s+", RED))))
     errors = [e for e in events if e.get("event") in
               ("page_failed", "daemon_error", "finalize_error", "page_timeout", "dedup_error")]
     if errors:
         e = errors[-1]
-        out.append(f"Last logged error: {e.get('ts','')} {e.get('page_id','')} {str(e.get('error',e.get('event')))[:90]}")
+        out.append(paint(f"Last logged error: {e.get('ts','')} {e.get('page_id','')} {str(e.get('error',e.get('event')))[:90]}", RED))
     out.append(f"DB/inventory snapshot age {snapshot_age:.1f}s | Ctrl+C closes monitor only")
     if warning:
-        out.append(f"SNAPSHOT WARNING: {warning}")
+        out.append(paint(f"SNAPSHOT WARNING: {warning}", YELLOW))
     return "\n".join(out)
 
 
