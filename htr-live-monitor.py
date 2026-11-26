@@ -10,6 +10,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -37,9 +38,9 @@ def paint(value, color):
 
 
 def state_color(state):
-    if state in ("INDEXED", "CHECKPOINT SAVED"):
+    if state in ("INDEXED", "ALIAS", "CHECKPOINT SAVED"):
         return GREEN
-    if state in ("OCR OK", "RECOGNIZING"):
+    if state in ("WAIT DB", "RECOGNIZING"):
         return CYAN
     if state in ("IDLE / DISCOVERY",):
         return GRAY
@@ -241,7 +242,7 @@ def operations(metas, rows, stable, limit):
             continue
         status = meta["status"]
         db_status = rows.get(pid, (None, 0))[0]
-        state = ("INDEXED" if db_status == "ok" else "OCR OK") if status == "ok" else "FAILED"
+        state = ("INDEXED" if db_status == "ok" else "ALIAS" if db_status == "duplicate" else "WAIT DB") if status == "ok" else "FAILED"
         lines = meta.get("line_count")
         if isinstance(lines, int):
             lines += meta.get("extra_line_count") or 0
@@ -251,10 +252,31 @@ def operations(metas, rows, stable, limit):
     return sorted(items, reverse=True)[:limit]
 
 
+def pipeline_counts(total, page, stable, rows, metas, max_attempts):
+    """Separate the verified active page from the waiting queue."""
+    pending, retry = total["pending"], total["retry"]
+    active = 0
+    rec = stable.get(page) if page else None
+    if rec and rows.get(page, (None, 0))[0] not in ("ok", "duplicate") and metas.get(page, {}).get("status") != "ok":
+        if not rec.get("parked") and (rec.get("attempts") or 0) < max_attempts:
+            if metas.get(page, {}).get("status") == "failed" or rows.get(page, (None, 0))[0] == "failed":
+                retry -= 1
+            else:
+                pending -= 1
+            active = 1
+    return pending, retry, active
+
+
+def fit(line, width):
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
+    return line if len(plain) <= width else plain[:max(0, width - 1)] + "…"
+
+
 def render(cfg, records, stable, rows, line_count, metas, events, tail,
            snapshot_age, warning=None):
     now = time.time()
-    width = min(150, shutil.get_terminal_size((120, 40)).columns)
+    columns, height = shutil.get_terminal_size((120, 40))
+    width = min(150, max(1, columns - 1))
     sources, total = classify(records, stable, rows, metas, int(cfg["max_attempts"]))
     daemon = read_json(Path(cfg["heartbeat_dir"]) / "daemon.json") or {}
     child = read_json(Path(cfg["heartbeat_dir"]) / "w0.json") or {}
@@ -273,20 +295,22 @@ def render(cfg, records, stable, rows, line_count, metas, events, tail,
     age = max(0, now - child["updated_epoch"]) if child_alive and isinstance(child.get("updated_epoch"), (int, float)) else None
     daemon_age = max(0, now - daemon["updated_epoch"]) if isinstance(daemon.get("updated_epoch"), (int, float)) else None
     timeout = cfg.get("page_timeout_s", 900)
+    last_round = next((e for e in reversed(events) if e.get("event") == "round_finished"), {})
     status = ("STOPPED / PID not verified" if not alive else
               "STALE CHILD HEARTBEAT" if age is not None and age > timeout else
               "RECOGNIZING" if phase == "page" else
               "MODEL INIT" if phase == "init" else
               "CHECKPOINT SAVED" if phase == "ok" else
-              "BETWEEN PAGES / FINALIZING" if daemon.get("phase") == "round" else
+              "BETWEEN SLICES / POSSIBLE FINALIZE" if daemon.get("phase") == "round" else
               "IDLE / DISCOVERY")
     good = total["indexed"] + total["duplicate"]
     recognized = good + total["ocr_ready"]
     remaining = total["pending"] + total["retry"]
+    pending, retry, active = pipeline_counts(total, page if status == "RECOGNIZING" else None, stable, rows, metas, int(cfg["max_attempts"]))
     rate, historical = rates(events)
     eta = remaining * 3600 / rate if rate else None
     recent = operations(metas, rows, stable, tail)
-    recent_durations = [m[4] for m in recent if m[3] in ("INDEXED", "OCR OK") and isinstance(m[4], (float, int))]
+    recent_durations = [m[4] for m in recent if m[3] in ("INDEXED", "WAIT DB", "ALIAS") and isinstance(m[4], (float, int))]
     average = sum(recent_durations) / len(recent_durations) if recent_durations else None
     peak = max(recent_durations, default=0)
     round_start = daemon.get("updated_epoch")
@@ -297,20 +321,19 @@ def render(cfg, records, stable, rows, line_count, metas, events, tail,
     out = [
         paint("HTR LIVE MONITOR", BOLD + CYAN) + f"   {clock(now)}   " + paint(status, state_color(status)),
         "=" * width,
-        f"CORPUS  {bar(recognized, total['discovered'])}  "
-        f"{number(recognized)}/{number(total['discovered'])} recognized/resolved",
-        f"Indexed OK {paint(number(total['indexed']), GREEN)} | aliases {number(total['duplicate'])} | "
-        f"OCR ready, not indexed {paint(number(total['ocr_ready']), CYAN)} | lines in DB {number(line_count)}",
-        f"Stable {number(total['stable'])} | pending {paint(number(total['pending']), GRAY)} | "
-        f"retry {paint(number(total['retry']), YELLOW if total['retry'] else GREEN)} | "
-        f"parked {paint(number(total['parked']), RED if total['parked'] else GREEN)} | "
-        f"unstable {number(total['discovered']-total['stable'])}",
-        f"Rate last 5 completed rounds: {f'{rate:.1f}/h' if rate is not None else '-'} | "
-        f"all timed rounds: {f'{historical:.1f}/h' if historical is not None else '-'} | "
-        f"ETA known pending: {paint(duration(eta), CYAN)} (future downloads excluded)",
-        f"Recent OCR avg: {duration(average)} | completed page checkpoints are visible before DB commit",
-        "",
-        "SOURCES          PROGRESS                     KNOWN    INDEXED   OCR READY   PENDING    RETRY/PARKED",
+        f"OCR / RESOLVED {bar(recognized, total['discovered'], min(24, max(4, width-55)))}  {number(recognized)}/{number(total['discovered'])}",
+        f"DB  / RESOLVED {bar(good, total['discovered'], min(24, max(4, width-55)))}  {number(good)}/{number(total['discovered'])}",
+        paint("PIPELINE (pages)", BOLD + CYAN),
+        f"01 DISCOVERY     {number(total['discovered'])} found | {number(total['discovered']-total['stable'])} not stable",
+        f"02 WAIT OCR      {paint(number(pending), GRAY)} queued | {paint(number(retry), YELLOW)} retry",
+        f"03 RECOGNIZING   {paint(number(active), CYAN)} active (verified pending page)",
+        f"04 WAIT DB       {paint(number(total['ocr_ready']), CYAN)} OCR saved, awaiting index",
+        f"05 INDEXED       {paint(number(total['indexed']), GREEN)} searchable | {number(total['duplicate'])} aliases | {number(line_count)} DB lines",
+        f"!! PARKED        {paint(number(total['parked']), RED if total['parked'] else GREEN)} need review",
+        f"Rate: {f'{rate:.1f}/h' if rate is not None else '-'} last 5 rounds | ETA OCR queue: {paint(duration(eta), CYAN)} (known only)",
+        f"All rounds: {f'{historical:.1f}/h' if historical is not None else '-'} | Recent OCR avg: {duration(average)}",
+        "-" * width,
+        "SOURCES          PROGRESS                     KNOWN    INDEXED     WAIT DB   PENDING    RETRY/PARKED",
     ]
     for source, c in sorted(sources.items()):
         n = c["indexed"] + c["duplicate"] + c["ocr_ready"]
@@ -325,9 +348,14 @@ def render(cfg, records, stable, rows, line_count, metas, events, tail,
                    f"phase {paint(phase or '-', state_color(status))} | page {paint(page or '-', CYAN)}")
         if phase == "page":
             idx, count = child.get("index"), child.get("total")
-            out.append(f"Slice page {paint(f'{idx or "-"}/{count or "-"}', CYAN)} | "
+            position = f"{idx or '-'}/{count or '-'}"
+            out.append(f"Slice page {paint(position, CYAN)} | "
                        f"current page elapsed {paint(duration(age), elapsed_color(age, peak))} | "
-                       f"completed checkpoints this round {paint(finished_in_round, GREEN)}")
+                       f"checkpoints since round start {paint(finished_in_round, GREEN)}")
+    if last_round:
+        fin = last_round.get("finalize", {})
+        out.append(f"Last completed batch #{last_round.get('round_no', '?')}: "
+                   f"{paint(fin.get('indexed', 0), GREEN)} indexed | {paint(fin.get('failed', 0), RED if fin.get('failed') else GREEN)} failed")
     try:
         free = shutil.disk_usage(cfg["runtime_root"]).free / 2**30
         floor = cfg.get("min_free_gb", 5)
@@ -335,9 +363,11 @@ def render(cfg, records, stable, rows, line_count, metas, events, tail,
         out.append(f"Runtime disk free {paint(f'{free:.1f} GiB', disk_color)} | safety floor {floor} GiB")
     except OSError:
         out.append("Runtime disk unavailable")
-    out += ["-" * width, paint("RECENT OPERATIONS", BOLD + CYAN) + "  (actual HTR completion time, not batch index time)",
+    out += ["-" * width, paint("RECENT OPERATIONS", BOLD + CYAN) + "  (OCR completion time; STATUS = current DB state)",
             "TIME      PAGE                         SOURCE          STATUS       TOTAL    LINES   CONF"]
-    for stamp, pid, source, state, elapsed, lines, confidence, error in recent:
+    # Keep the pipeline and worker details; shrink recent history.
+    visible_recent = max(1, height - len(out) - 5)
+    for stamp, pid, source, state, elapsed, lines, confidence, error in recent[:visible_recent]:
         conf = f"{confidence:.3f}" if isinstance(confidence, (int,float)) else "-"
         out.append(f"{clock(stamp):<9} {pid:<28} {source:<15} {paint(f'{state:<11}', state_color(state))} "
                    f"{paint(f'{duration(elapsed):>8}', elapsed_color(elapsed, peak))} {number(lines):>7} {conf:>6}"
@@ -356,7 +386,7 @@ def render(cfg, records, stable, rows, line_count, metas, events, tail,
     out.append(f"DB/inventory snapshot age {snapshot_age:.1f}s | Ctrl+C closes monitor only")
     if warning:
         out.append(paint(f"SNAPSHOT WARNING: {warning}", YELLOW))
-    return "\n".join(out)
+    return "\n".join(fit(line, width) for line in out)
 
 
 def main():
