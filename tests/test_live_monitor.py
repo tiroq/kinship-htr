@@ -53,4 +53,17 @@ with tempfile.TemporaryDirectory() as tmp:
     assert m.operations(result, {"c": ("ok", 14)}, stable, 10)[0][3] == "INDEXED"
     p.unlink()
     assert cache.scan() == {}
+# Same color semantics as GAVO; plain output stays pipe-friendly.
+assert m.state_color("INDEXED") == m.GREEN
+assert m.state_color("OCR OK") == m.CYAN
+assert m.state_color("FAILED") == m.RED
+assert m.elapsed_color(2, 20) == m.GREEN
+assert m.elapsed_color(6, 20) == m.YELLOW
+assert m.elapsed_color(12, 20) == m.ORANGE
+assert m.elapsed_color(18, 20) == m.RED
+m.COLOR = False
+assert m.bar(1, 2, 4) == "██░░  50.0%"
+m.COLOR = True
+assert m.paint("OK", m.GREEN) == m.GREEN + "OK" + m.RESET
+assert m.GREEN + "██" + m.RESET in m.bar(1, 2, 4)
 print("test_live_monitor: ALL PASS")
