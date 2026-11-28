@@ -5,7 +5,8 @@ Reuses the proven 8-page benchmark artifacts when provenance matches, then
 processes remaining pages with the pinned htrbench environment:
   engine  crnn-ctc (achimrabus/crnn-ctc-russian, sha256 74482bd0…)
   seg     kraken-blla (pagexml/blla.mlmodel, sha256 77a638a8…)
-  patch   bench-patch.diff (min line 15px + width guard) — already applied
+  patch   polyscriptor-local.patch (min line 15px + width guard;
+          formerly bench-patch.diff, consolidated) — already applied
 Outputs per page:  work/index/ocr/<page_id>/
   transcriptions/<page_id>.{json,txt,csv}   page_xml/<page_id>.xml
   meta.json (status+provenance)             stage_b.json (gap recovery)
@@ -61,7 +62,21 @@ PROGRESS_LOG = LOGDIR / "progress.jsonl"
 
 MODEL_SHA = "74482bd0eb8e33b25a197d0452559b888809dd0ae4e014274301a513f553dd32"
 BLLA_SHA = "77a638a83c9e535620827a09e410ed36391e9e8e8366d5796a0f15b978186056"
-PATCH_ID = "bench-patch.diff (min_height 40->15 + width guard, applied)"
+PATCH_ID = ("polyscriptor-local.patch (formerly bench-patch.diff; "
+            "min_height 40->15 + width guard, applied)")
+
+# Canonical identity of the recognition configuration.  Shared with the
+# indexer's content+config dedup key (htr_worker) — must stay equal to the
+# provenance of artifacts produced by worker_main.
+RECOGNITION_IDENTITY = {
+    "engine": "crnn-ctc (PyLaia-inspired CRNN-CTC)",
+    "model": "achimrabus/crnn-ctc-russian 'Russian (6.92% CER)'",
+    "model_sha256": MODEL_SHA,
+    "segmentation": "kraken-blla",
+    "segmentation_sha256": BLLA_SHA,
+    "patch": PATCH_ID,
+    "device": "cpu",
+}
 
 CASES = {"253": "0597-0001-000253", "255": "0597-0001-000255",
          "256": "0597-0001-000256", "258": "0597-0001-000258"}
@@ -133,25 +148,27 @@ def load_pages() -> list[dict]:
 
 
 def provenance(page: dict, reused: bool = False) -> dict:
+    ident = RECOGNITION_IDENTITY
     return {
         "page_id": page["page_id"], "case_id": page["case_id"],
         "page_number": page["page_number"], "image_path": page["image_path"],
         "image_sha256": page["image_sha256"],
-        "engine": "crnn-ctc (PyLaia-inspired CRNN-CTC)",
-        "model": "achimrabus/crnn-ctc-russian 'Russian (6.92% CER)'",
-        "model_sha256": MODEL_SHA, "segmentation": "kraken-blla",
-        "blla_sha256": BLLA_SHA, "patch": PATCH_ID,
+        "engine": ident["engine"], "model": ident["model"],
+        "model_sha256": ident["model_sha256"],
+        "segmentation": ident["segmentation"],
+        "blla_sha256": ident["segmentation_sha256"],
+        "patch": ident["patch"],
         "env": "miniconda htrbench (see env-versions.txt; python 3.12, torch 2.14.0, kraken 7.1.1)",
-        "device": "cpu", "reused_from_benchmark": reused,
+        "device": ident["device"], "reused_from_benchmark": reused,
     }
 
 
-def meta_path(page_id: str) -> Path:
-    return OUT_ROOT / page_id / "meta.json"
+def meta_path(page_id: str, out_root: Path | None = None) -> Path:
+    return (out_root or OUT_ROOT) / page_id / "meta.json"
 
 
-def page_status(page_id: str) -> str | None:
-    mp_ = meta_path(page_id)
+def page_status(page_id: str, out_root: Path | None = None) -> str | None:
+    mp_ = meta_path(page_id, out_root)
     if not mp_.exists():
         return None
     try:
@@ -160,9 +177,9 @@ def page_status(page_id: str) -> str | None:
         return None
 
 
-def checkpoint_problems(page_id: str) -> list[str]:
+def checkpoint_problems(page_id: str, out_root: Path | None = None) -> list[str]:
     """Missing/empty/undecodable artifacts for a page marked ok."""
-    d = OUT_ROOT / page_id
+    d = (out_root or OUT_ROOT) / page_id
     probs = []
     for rel_t in PAGE_ARTIFACTS:
         rel = rel_t.format(pid=page_id)
@@ -232,8 +249,8 @@ def reuse_bench8(pages: list[dict]) -> int:
     return reused
 
 
-def mark_page_failed(page: dict, error: str) -> None:
-    mp = meta_path(page["page_id"])
+def mark_page_failed(page: dict, error: str, out_root: Path | None = None) -> None:
+    mp = meta_path(page["page_id"], out_root)
     mp.parent.mkdir(parents=True, exist_ok=True)  # failure can precede any mkdir
     meta = provenance(page)
     meta["status"] = "failed"
@@ -242,15 +259,22 @@ def mark_page_failed(page: dict, error: str) -> None:
     atomic_write_json(mp, meta)
 
 
-def worker_main(worker_id: int, pages: list[dict], do_stage_b: bool, threads: int):
+def worker_main(worker_id: int, pages: list[dict], do_stage_b: bool,
+                threads: int, out_root: Path | None = None,
+                hb_root: Path | None = None):
     """Runs in a spawned child: holds models in memory, processes its page slice.
 
     Durability: meta.json is written last and atomically; a kill at any point
     leaves the page either fully valid or fully absent.  Heartbeats go to
-    HB_ROOT/w<worker_id>.json so the parent watchdog can time out a stuck
+    hb_root/w<worker_id>.json so the parent watchdog can time out a stuck
     page and kill this process externally.
+
+    out_root/hb_root default to the historical work/index layout; the
+    incremental indexer passes its own runtime directories.
     """
-    hb_path = HB_ROOT / f"w{worker_id}.json"
+    root = out_root or OUT_ROOT
+    hb_dir = hb_root or HB_ROOT
+    hb_path = hb_dir / f"w{worker_id}.json"
 
     def heartbeat(page_id, phase, **kw):
         rec = {"pid": os.getpid(), "worker": worker_id, "phase": phase,
@@ -258,7 +282,7 @@ def worker_main(worker_id: int, pages: list[dict], do_stage_b: bool, threads: in
         rec.update(kw)
         atomic_write_json(hb_path, rec)
 
-    HB_ROOT.mkdir(parents=True, exist_ok=True)
+    hb_dir.mkdir(parents=True, exist_ok=True)
     heartbeat(None, "init")
     sys.path.insert(0, str(POLY))
     import numpy as np  # noqa: F401
@@ -272,7 +296,7 @@ def worker_main(worker_id: int, pages: list[dict], do_stage_b: bool, threads: in
     import stage_b_layout
     from batch_processing import BatchHTRProcessor, parse_args
     import logging
-    tmp = OUT_ROOT / f"_tmp_worker{worker_id}"
+    tmp = root / f"_tmp_worker{worker_id}"
     (tmp / "input").mkdir(parents=True, exist_ok=True)
     sys.argv = ["batch_processing.py",
                 "--input-folder", str(tmp / "input"),
@@ -295,11 +319,11 @@ def worker_main(worker_id: int, pages: list[dict], do_stage_b: bool, threads: in
 
     for i, p in enumerate(pages):
         pid = p["page_id"]
-        if page_status(pid) is not None:  # another worker / earlier run finished it
+        if page_status(pid, root) is not None:  # another worker / earlier run finished it
             continue
         heartbeat(pid, "page", index=i + 1, total=len(pages))
         t0 = time.time()
-        d = OUT_ROOT / pid
+        d = root / pid
         try:
             img = tmp / "input" / f"{pid}.jpg"
             if img.is_symlink() or img.exists():

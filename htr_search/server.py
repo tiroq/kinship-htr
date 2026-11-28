@@ -91,9 +91,9 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(r"^/api/line/(\d+)$", route)
             if m:
                 return self.api_line(int(m.group(1)))
-            m = re.match(r"^/api/image/([0-9]{3}-p[0-9]{3,})$", route)
+            m = re.match(r"^/api/image/([0-9A-Za-z._-]+)$", route)
             if m:
-                return self.api_image(m.group(1))
+                return self.api_image(m.group(1), self._q())
             m = re.match(r"^/api/crop/(\d+)$", route)
             if m:
                 return self.api_crop(int(m.group(1)), self._q())
@@ -113,8 +113,13 @@ class Handler(BaseHTTPRequestHandler):
         if q.get("profile") in PROFILES:
             variants = profile_variants(q["profile"])["all"]
         case = q.get("case") or None
+        filters = {}
+        for key in ("collection", "fond", "opis", "delo", "page"):
+            if q.get(key):
+                filters[key] = q[key]
+        filters["exact"] = q.get("exact") in ("1", "true", "yes")
         hits = s.search_lines(query, variants=variants, case=case,
-                              limit=int(q.get("limit", 100)))
+                              limit=int(q.get("limit", 100)), **filters)
         rf = q.get("review_filter")
         if rf == "reviewed":
             hits = [h for h in hits if h.review]
@@ -179,17 +184,37 @@ class Handler(BaseHTTPRequestHandler):
         return [rows[j] for j in range(max(0, idx - k),
                                        min(len(rows), idx + k + 1)) if j != idx]
 
-    def api_image(self, page_id: str):
+    def api_image(self, page_id: str, q: dict | None = None):
         conn = Searcher().conn
         row = conn.execute("SELECT image_path FROM pages WHERE page_id=?",
                            (page_id,)).fetchone()
+        highlight = None
+        if q and q.get("highlight"):
+            hrow = conn.execute(
+                "SELECT bbox, source FROM lines WHERE line_id=? AND page_id=?",
+                (int(q["highlight"]), page_id)).fetchone()
+            if hrow:
+                highlight = (json.loads(hrow["bbox"]), hrow["source"])
         conn.close()
         if not row:
             return self._json({"error": "no such page"}, 404)
         path = Path(row["image_path"])
         if not path.exists():
             return self._json({"error": "image missing"}, 404)
-        body = path.read_bytes()
+        if highlight:
+            # rectangle around the matched line on the ORIGINAL scan
+            from PIL import Image, ImageDraw
+            (x, y, w, h), source = highlight
+            img = Image.open(path).convert("RGB")
+            dr = ImageDraw.Draw(img)
+            color = (255, 60, 60) if source == "blla-ocr" else (60, 160, 255)
+            dr.rectangle([x - 4, y - 4, x + w + 4, y + h + 4],
+                         outline=color, width=6)
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=90)
+            body = buf.getvalue()
+        else:
+            body = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(body)))
@@ -327,29 +352,46 @@ class Handler(BaseHTTPRequestHandler):
         s = self._searcher()
         row = s.conn.execute(
             "SELECT l.page_id, l.line_number, l.bbox, l.text_raw, "
-            "p.case_id, p.page_number, p.image_sha256 "
+            "p.case_id, p.page_number, p.image_sha256, p.provenance "
             "FROM lines l JOIN pages p USING(page_id) WHERE l.line_id=?",
             (line_id,)).fetchone()
         if not row:
             s.close()
             return self._json({"error": "no such line"}, 404)
         notes = (data.get("notes") or "").strip() or None
+        # binding: image sha + CURRENT recognition revision + line geometry
+        revision = 1
+        if row["provenance"]:
+            try:
+                revision = int(json.loads(row["provenance"]).get("revision") or 1)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                revision = 1
+        from htr_sidecar import xywh_to_xyxy
+        bbox_xyxy = xywh_to_xyxy(json.loads(row["bbox"]))
+        # re-reviews of the same line update the SAME durable record
+        existing = s.conn.execute(
+            "SELECT record_id FROM reviews WHERE line_id=? AND "
+            "match_state='active'", (line_id,)).fetchone()
+        from htr_reviews import make_record, save_review
+        record = make_record(
+            page_id=row["page_id"], line_number=row["line_number"],
+            image_sha256=row["image_sha256"],
+            recognition_revision=revision, bbox_xyxy=bbox_xyxy,
+            decision=decision, verified_text=verified_text or None,
+            notes=notes, model_text=row["text_raw"],
+            reviewer=data.get("reviewer", "local-human"),
+            case_id=row["case_id"], page_number=row["page_number"],
+            record_id=(existing["record_id"] if existing else None))
         # Human-supplied text only; provisional/AI drafts are never read here.
-        s.conn.execute(
-            "INSERT INTO reviews(line_id, page_id, line_number, decision, verified_text, "
-            "notes, source_sha256, case_id, page_number, bbox, model_text, "
-            "reviewer, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(line_id) DO UPDATE SET decision=excluded.decision, "
-            "verified_text=excluded.verified_text, notes=excluded.notes, "
-            "updated_at=excluded.updated_at",
-            (line_id, row["page_id"], row["line_number"], decision, verified_text or None, notes,
-             row["image_sha256"], row["case_id"], row["page_number"],
-             row["bbox"], row["text_raw"],
-             data.get("reviewer", "local-human"),
-             time.strftime("%Y-%m-%dT%H:%M:%S%z")))
-        s.conn.commit()
+        # Durable JSONL first (survives DB loss), then the DB view.
+        from htr_config import load as load_config
+        cfg = load_config()
         s.close()
-        self._json({"ok": True, "line_id": line_id, "decision": decision})
+        save_review(cfg, DB_PATH, record, line_id=line_id,
+                    match_state="active", match_reason=None)
+        self._json({"ok": True, "line_id": line_id, "decision": decision,
+                    "record_id": record["record_id"],
+                    "recognition_revision": revision})
 
 
 def main() -> int:

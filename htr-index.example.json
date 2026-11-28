@@ -1,0 +1,54 @@
+{
+  "_comment": "Copy to htr-index.json (gitignored) and adjust paths. All relative paths resolve against repo_root. See README.md.",
+  "runtime_root": "work/indexer",
+  "db_path": "work/index/htr.db",
+  "python_env": "/Users/mysterx/miniconda3/envs/htrbench/bin/python",
+  "polyscriptor_dir": "polyscriptor",
+  "threads": 1,
+  "workers": 1,
+  "nice": 10,
+  "page_timeout_s": 900,
+  "poll_interval_s": 60,
+  "round_pages": 20,
+  "min_free_gb": 5.0,
+  "max_attempts": 3,
+  "sidecar_mode": "mirror",
+  "sources": [
+    {
+      "id": "gavo",
+      "root": "/Users/mysterx/Downloads/kinship-gavo",
+      "collection": "gavo",
+      "archive": "ГАВО (Государственный архив Воронежской области)",
+      "include": ["I-331-op3-d*/originals/*.jpg"],
+      "manifest": "gavo",
+      "priority": 2
+    },
+    {
+      "id": "torrents",
+      "root": "/Volumes/T7 Shield/Kinship/torrents",
+      "collection": "torrent",
+      "archive": "ГАВО (Государственный архив Воронежской области)",
+      "include": ["**/*.jpg", "**/*.jpeg"],
+      "manifest": "filename",
+      "priority": 3
+    },
+    {
+      "id": "cgamos-597",
+      "root": "/Users/mysterx/dev/kinship-case/sources/cgamos-online",
+      "collection": "cgamos-597",
+      "archive": "ЦГА Москвы",
+      "include": ["597-1-*/originals/*.jpg"],
+      "manifest": "legacy",
+      "priority": 4
+    },
+    {
+      "id": "cgamos-misc",
+      "root": "/Users/mysterx/dev/kinship-case/sources/cgamos-online",
+      "collection": "cgamos-misc",
+      "archive": "ЦГА Москвы",
+      "include": ["*.png", "*.jpg", "opis-t*-pages/*.png", "gk-pages/*.png"],
+      "manifest": "none",
+      "priority": 9
+    }
+  ]
+}
